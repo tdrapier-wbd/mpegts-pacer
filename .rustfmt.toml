@@ -1,0 +1,4 @@
+# Hard tabs, matching the crate's original moq-dev formatting.
+hard_tabs = true
+
+max_width = 120
