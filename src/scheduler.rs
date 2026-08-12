@@ -131,6 +131,10 @@ struct StreamGrid {
 	/// Slots spanned by the previous run, used to place a trailing run at the
 	/// same spacing when the source ends mid-run.
 	last_span: Option<(u64, usize)>,
+	/// The lowest slot still free. A PCR interval carrying more packets than the
+	/// mux rate has room for spills into the slots after it rather than losing
+	/// the excess; see [`StreamGrid::close_run`].
+	next_free: u64,
 	capacity: usize,
 }
 
@@ -143,6 +147,7 @@ impl StreamGrid {
 			placed: VecDeque::new(),
 			epoch: 0,
 			last_span: None,
+			next_free: 0,
 			capacity: capacity.max(1),
 		}
 	}
@@ -191,6 +196,14 @@ impl StreamGrid {
 	}
 
 	/// Spread the open run between its own slot and `next_slot`.
+	///
+	/// A PCR interval can carry more packets than the mux rate has slots for —
+	/// video is not flat, and a groomer is normally provisioned against the
+	/// average rate rather than the peak. The excess spills into the slots after
+	/// the run instead of being discarded, and later runs start from the first
+	/// free slot, so a peak is absorbed by the stuffing that follows it and the
+	/// stream catches back up. Placement stays a function of the delivered
+	/// packets alone, which is what keeps two legs identical.
 	fn close_run(&mut self, next_slot: u64) -> u64 {
 		let Some((_, open_slot)) = self.open else {
 			return 0;
@@ -203,8 +216,10 @@ impl StreamGrid {
 		self.last_span = Some((span, count));
 		let mut dropped = 0;
 		for (index, packet) in self.run.drain(..).enumerate() {
-			let offset = (index as u64).saturating_mul(span) / count as u64;
-			self.placed.push_back((open_slot + offset, packet));
+			let ideal = open_slot + (index as u64).saturating_mul(span) / count as u64;
+			let slot = ideal.max(self.next_free);
+			self.next_free = slot + 1;
+			self.placed.push_back((slot, packet));
 			if self.placed.len() > self.capacity {
 				self.placed.pop_front();
 				dropped += 1;
@@ -1036,16 +1051,33 @@ mod tests {
 	/// A synthetic source: `runs` PCR intervals of [`RUN_LEN`] packets, each
 	/// packet tagged with the media time at which a well-behaved path delivers it.
 	fn stream_packets(runs: usize) -> Vec<(Packet, Duration)> {
+		stream_packets_with_peak(runs, usize::MAX, 0)
+	}
+
+	/// The same, but every `every` runs carries `peak` packets instead of
+	/// [`RUN_LEN`] — a stream whose instantaneous rate exceeds the mux rate for
+	/// one PCR interval, as an I-frame does.
+	fn stream_packets_with_peak(runs: usize, every: usize, peak: usize) -> Vec<(Packet, Duration)> {
 		let mut out = Vec::new();
 		for run in 0..runs {
 			let pcr = run as u64 * RUN_SLOTS * TICKS_PER_PACKET;
 			let at = pcr::ticks_to_duration(pcr);
-			for index in 0..RUN_LEN {
+			let len = if run > 0 && run % every == 0 { peak } else { RUN_LEN };
+			for index in 0..len {
 				let packet = content_packet(0x100, (index == 0).then_some(pcr));
 				out.push((packet, at + Duration::from_micros(index as u64 * 10)));
 			}
 		}
 		out
+	}
+
+	/// Content packets in the output, by continuity counter, so a test can say
+	/// what reached the wire rather than only where it sat.
+	fn content_count(leg: &[(Framing, Vec<u8>)]) -> usize {
+		leg.iter()
+			.flat_map(|(_, dg)| dg.chunks_exact(TS_PACKET_SIZE))
+			.filter(|p| pid_of(p) == 0x100)
+			.count()
 	}
 
 	/// Everything about a leg that is a property of the leg rather than of the
@@ -1154,6 +1186,31 @@ mod tests {
 		let smooth = run_leg(&cfg, &arrivals, t0, &PUNCTUAL, 2_000);
 		let rough = run_leg(&cfg, &arrivals, t0, &JITTERY, 2_000);
 		assert_ne!(by_slot(&smooth), by_slot(&rough));
+	}
+
+	#[test]
+	fn a_rate_peak_spills_forward_instead_of_being_dropped() {
+		// A PCR interval carrying more packets than the mux rate has room for is
+		// ordinary VBR video against a groomer provisioned on the average rate.
+		// The excess has to go in the slots after the peak: dropping it would be a
+		// groomer quietly deleting programme, and dropping it identically on both
+		// legs would make a redundant pair agree on damage.
+		let cfg = stream_config();
+		// 90 packets where the grid has 40 slots: two and a bit intervals' worth.
+		let arrivals = stream_packets_with_peak(60, 10, 90);
+		let t0 = Instant::now();
+		let smooth = run_leg(&cfg, &arrivals, t0, &PUNCTUAL, 3_000);
+		let rough = run_leg(&cfg, &arrivals, t0, &JITTERY, 3_000);
+
+		// Everything the source produced, less the packets before the first PCR
+		// (there is no grid to place those on) and the run left open at the end.
+		let peaks = arrivals.len() - RUN_LEN;
+		assert!(
+			content_count(&smooth) >= peaks - RUN_LEN,
+			"the peak cost content: {} of {peaks} packets reached the wire",
+			content_count(&smooth)
+		);
+		assert_eq!(by_slot(&smooth), by_slot(&rough), "the path changed the output");
 	}
 
 	#[test]
