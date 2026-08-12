@@ -98,7 +98,7 @@ where
 				Arrival::Eof => return Ok(scheduler.stats()),
 				Arrival::Silent => {
 					let now = tokio_instant::now_std();
-					reporter.report(&mut observer, &scheduler, now);
+					reporter.report(&mut observer, &scheduler, scheduler.state(now), now);
 					if stalls_hard(&config) {
 						return Err(Error::SourceStalled {
 							silent_for: now.saturating_duration_since(started_at),
@@ -121,7 +121,11 @@ where
 			// under a backlog, so ingest can't starve emission.
 			_ = sleep => {
 				let now = tokio_instant::now_std();
-				match (scheduler.state(now), config.stall_policy) {
+				// One state read per slot: the buffer can empty *inside* this slot,
+				// so re-reading it after emitting would report a stall the slot's
+				// own bookkeeping has not counted yet.
+				let state = scheduler.state(now);
+				match (state, config.stall_policy) {
 					// The source is gone, not late. Hold the byte clock but put
 					// nothing on the wire, so downstream sees the carrier stop
 					// instead of a programme-free stream it will read as healthy.
@@ -135,7 +139,7 @@ where
 						sink.send(datagram).await?;
 					}
 				}
-				reporter.report(&mut observer, &scheduler, now);
+				reporter.report(&mut observer, &scheduler, state, now);
 			}
 			maybe = source.recv(), if !closing => {
 				match maybe? {
@@ -191,8 +195,10 @@ impl Reporter {
 	}
 
 	/// Report if the state changed or the heartbeat is due.
-	fn report<Obs: Observer>(&mut self, observer: &mut Obs, scheduler: &Scheduler, now: Instant) {
-		let state = scheduler.state(now);
+	///
+	/// `state` is the state the caller acted on, not a fresh reading, so the
+	/// counters in the report describe the same slot as the state it names.
+	fn report<Obs: Observer>(&mut self, observer: &mut Obs, scheduler: &Scheduler, state: SourceState, now: Instant) {
 		let due = match self.last {
 			None => true,
 			Some((last_state, at)) => last_state != state || now.saturating_duration_since(at) >= HEALTH_INTERVAL,

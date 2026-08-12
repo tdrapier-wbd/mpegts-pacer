@@ -339,6 +339,42 @@ async fn stalled_source_mutes_the_carrier() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_first_stall_report_carries_the_stall_it_announces() {
+	// The buffer can run dry *inside* an output slot, so the state read after
+	// emitting differs from the one the slot acted on. Reporting that later
+	// reading announced a stall against counters taken before it: an operator
+	// watching the alarm read "stall #0, 0 ms" for a source gone for seconds.
+	let sent: Timeline = Arc::new(Mutex::new(Vec::new()));
+	let log = Arc::new(Mutex::new(Vec::new()));
+	let config = Config::new(MUX_RATE)
+		.with_latency(Duration::from_millis(50))
+		.with_stall_timeout(Some(Duration::from_millis(500)));
+
+	let _ = tokio::time::timeout(
+		Duration::from_secs(3),
+		pace_with(
+			config,
+			StallingSource::silent_after(media_stream(700, 5_000_000, 7)),
+			StampedSink::new(sent.clone()),
+			recording_observer(log.clone()),
+		),
+	)
+	.await;
+
+	let log = log.lock().unwrap().clone();
+	let first = log
+		.iter()
+		.find(|health| health.source == SourceState::Stalled)
+		.expect("the stall is reported");
+	assert_eq!(first.stats.stalls, 1, "the report names the stall it is announcing");
+	assert!(
+		first.stats.content_gap_max_ms >= 500,
+		"and the silence that caused it, not {} ms",
+		first.stats.content_gap_max_ms
+	);
+}
+
+#[tokio::test(start_paused = true)]
 async fn stall_detection_can_be_disabled() {
 	// The inverse of the test above, and the escape hatch for a plant that wants
 	// the pre-0.2 behaviour: no timeout, so silence is never a fault.
