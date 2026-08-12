@@ -64,6 +64,13 @@ pub struct Stats {
 	/// the path is delivering faster than the mux rate for long enough to build
 	/// a buffer, i.e. the configured rate is below the content rate.
 	pub resyncs: u64,
+	/// Stream in hand when the output clock started, in 188-byte packets at the
+	/// mux rate — the depth of the backlog a leg was handed as it joined.
+	///
+	/// Zero for a leg that started with the broadcast. A large value on a leg
+	/// that joined one already running says the relay served it from well behind
+	/// the live edge, which is where its phase relative to a partner comes from.
+	pub start_backlog: u64,
 }
 
 impl Stats {

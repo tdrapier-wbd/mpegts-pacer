@@ -467,6 +467,7 @@ impl Scheduler {
 				self.anchor = Some(self.anchor.unwrap_or(now + self.latency));
 				self.anchor_slot = start - (start % per_datagram);
 				self.slot = self.anchor_slot;
+				self.stats.start_backlog = edge - first;
 			}
 			return;
 		}

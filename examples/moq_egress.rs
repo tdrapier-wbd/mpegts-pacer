@@ -166,7 +166,7 @@ fn liveness() -> CallbackObserver<impl FnMut(Health) + Send> {
 fn report(stats: &Stats) {
 	eprintln!(
 		"mpegts-pacer: done. output_packets={} content={} null={} ({:.1}% stuffing) \
-		 pcr_inserted={} stripped_nulls={} dropped={} late_drops={} resyncs={} underruns={} \
+		 pcr_inserted={} stripped_nulls={} dropped={} late_drops={} resyncs={} start_backlog={} underruns={} \
 		 stalls={} muted={} max_content_gap={} ms",
 		stats.output_packets,
 		stats.content_packets,
@@ -177,6 +177,7 @@ fn report(stats: &Stats) {
 		stats.dropped_packets,
 		stats.late_drops,
 		stats.resyncs,
+		stats.start_backlog,
 		stats.underruns,
 		stats.stalls,
 		stats.muted_packets,
