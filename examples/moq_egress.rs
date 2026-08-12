@@ -20,18 +20,25 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use mpegts_pacer::{Config, PcrMode, ReadSource, RtpSink, Stats, UdpSink, WriteSink, pace};
+use mpegts_pacer::{
+	CallbackObserver, Config, Health, PcrMode, ReadSource, RtpSink, SourceState, StallPolicy, Stats, UdpSink,
+	WriteSink, pace_with,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let mut args = std::env::args().skip(1);
-	let usage = "usage: moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--latency-ms N]";
+	let usage = "usage: moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--latency-ms N] [--max-latency-ms N] [--ssrc N] [--stall-ms N] [--on-stall mute|continue|fail]";
 	let dest = args.next().expect(usage);
 	let rate = args.next().expect(usage);
 
 	let mut rtp = false;
 	let mut pcr = PcrMode::Regenerate;
 	let mut latency = Duration::from_millis(200);
+	let mut max_latency = None;
+	let mut ssrc = None;
+	let mut stall_timeout = None;
+	let mut stall_policy = None;
 	let mut rest = args.peekable();
 	while let Some(arg) = rest.next() {
 		match arg.as_str() {
@@ -41,18 +48,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 				let ms: u64 = rest.next().expect("--latency-ms needs a value").parse()?;
 				latency = Duration::from_millis(ms);
 			}
+			"--max-latency-ms" => {
+				let ms: u64 = rest.next().expect("--max-latency-ms needs a value").parse()?;
+				max_latency = Some(Duration::from_millis(ms));
+			}
+			"--ssrc" => ssrc = Some(rest.next().expect("--ssrc needs a value").parse::<u32>()?),
+			// 0 disables stall detection: hold the carrier however long the source
+			// is gone, which is what every pacer did before this was configurable.
+			"--stall-ms" => {
+				let ms: u64 = rest.next().expect("--stall-ms needs a value").parse()?;
+				stall_timeout = Some((ms > 0).then(|| Duration::from_millis(ms)));
+			}
+			"--on-stall" => {
+				stall_policy = Some(match rest.next().expect("--on-stall needs a value").as_str() {
+					"mute" => StallPolicy::Mute,
+					"continue" => StallPolicy::Continue,
+					"fail" => StallPolicy::Fail,
+					other => panic!("unknown stall policy {other:?}; expected mute, continue or fail"),
+				});
+			}
 			other => panic!("unknown argument {other:?}; {usage}"),
 		}
 	}
 
 	let source = ReadSource::new(tokio::io::stdin());
-	let config = if rate == "auto" {
+	let mut config = if rate == "auto" {
 		Config::auto()
 	} else {
 		Config::new(rate.parse().expect("bitrate must be an integer or \"auto\""))
 	}
 	.with_latency(latency)
 	.with_pcr_mode(pcr);
+	if let Some(max) = max_latency {
+		config = config.with_max_latency(max);
+	}
+	if let Some(timeout) = stall_timeout {
+		config = config.with_stall_timeout(timeout);
+	}
+	if let Some(policy) = stall_policy {
+		config = config.with_stall_policy(policy);
+	}
 
 	let pcr_desc = if pcr == PcrMode::Regenerate {
 		"regenerate PCR"
@@ -65,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			"mpegts-pacer: -> stdout (raw ts) @ {rate} b/s, {pcr_desc}, {} ms latency",
 			latency.as_millis()
 		);
-		pace(config, source, WriteSink::new(tokio::io::stdout())).await?
+		pace_with(config, source, WriteSink::new(tokio::io::stdout()), liveness()).await?
 	} else {
 		let destination: SocketAddr = dest.parse().expect("dest must be ip:port, - or stdout");
 		let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -75,9 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			latency.as_millis(),
 		);
 		if rtp {
-			pace(config, source, RtpSink::new(socket, destination)).await?
+			let sink = match ssrc {
+				Some(id) => RtpSink::with_ssrc(socket, destination, id),
+				None => RtpSink::new(socket, destination),
+			};
+			pace_with(config, source, sink, liveness()).await?
 		} else {
-			pace(config, source, UdpSink::new(socket, destination)).await?
+			pace_with(config, source, UdpSink::new(socket, destination), liveness()).await?
 		}
 	};
 
@@ -85,10 +124,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	Ok(())
 }
 
+/// Log liveness transitions to stderr.
+///
+/// Without this a dead source is invisible from the outside: the egress holds its
+/// rate whether or not there is a programme in it, so an operator watching bitrate
+/// or packet arrival sees a healthy leg either way.
+fn liveness() -> CallbackObserver<impl FnMut(Health) + Send> {
+	let mut last: Option<SourceState> = None;
+	CallbackObserver::new(move |health: Health| {
+		if last.replace(health.source) == Some(health.source) {
+			return;
+		}
+		match health.source {
+			SourceState::Stalled => eprintln!(
+				"mpegts-pacer: SOURCE STALLED (stall #{}, {} ms without content)",
+				health.stats.stalls, health.stats.content_gap_max_ms,
+			),
+			state => eprintln!("mpegts-pacer: source {state:?}"),
+		}
+	})
+}
+
 fn report(stats: &Stats) {
 	eprintln!(
 		"mpegts-pacer: done. output_packets={} content={} null={} ({:.1}% stuffing) \
-		 pcr_inserted={} stripped_nulls={} dropped={} underruns={}",
+		 pcr_inserted={} stripped_nulls={} dropped={} underruns={} \
+		 stalls={} muted={} max_content_gap={} ms",
 		stats.output_packets,
 		stats.content_packets,
 		stats.null_packets,
@@ -97,5 +158,8 @@ fn report(stats: &Stats) {
 		stats.input_nulls_stripped,
 		stats.dropped_packets,
 		stats.underruns,
+		stats.stalls,
+		stats.muted_packets,
+		stats.content_gap_max_ms,
 	);
 }

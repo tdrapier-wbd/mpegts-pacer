@@ -48,12 +48,29 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Content liveness
+//!
+//! Stuffing null packets to hold a rate is the right answer to a *late* source and
+//! the wrong answer to an *absent* one. A pacer left to it will emit a
+//! byte-perfect carrier — valid transport, correct rate, PCR present and accurate
+//! — with no programme in it, for as long as it is left running, and every signal
+//! a monitor or a 1+1 receiver keys on (arrival, loss, continuity) reads healthy.
+//!
+//! So the pacer tracks when content last *arrived*, not just what it emitted. Past
+//! [`Config::stall_timeout`] the source is treated as gone: no PCR is inserted
+//! into a programme-free stream, and [`Config::stall_policy`] decides what happens
+//! to the carrier — by default [`StallPolicy::Mute`], which stops emitting while
+//! holding the output byte clock, and resumes when content returns.
+//! [`SourceState`] is observable while the pacer runs, via
+//! [`TsPacer::watch_health`] or [`pace_with`].
 
 mod config;
 mod error;
 mod estimate;
 mod jitter_buffer;
 mod null_insertion;
+mod observe;
 mod output;
 mod pacer;
 mod packet;
@@ -64,13 +81,14 @@ mod stats;
 
 pub use config::{
 	Bitrate, Config, DEFAULT_AUTO_FALLBACK, DEFAULT_AUTO_HEADROOM, DEFAULT_LATENCY, DEFAULT_MAX_LATENCY,
-	DEFAULT_PACKETS_PER_DATAGRAM, PcrMode,
+	DEFAULT_PACKETS_PER_DATAGRAM, DEFAULT_STALL_TIMEOUT, PcrMode, StallPolicy,
 };
 pub use error::{Error, Result};
 pub use estimate::estimate_content_bitrate;
 pub use null_insertion::NULL_PID;
+pub use observe::{CallbackObserver, Health, Observer, SourceState};
 pub use output::{CallbackSink, RTP_PAYLOAD_TYPE_MP2T, RtpSink, Sink, UdpSink, WriteSink};
-pub use pacer::{TsPacer, pace};
+pub use pacer::{TsPacer, pace, pace_with};
 pub use packet::{Packet, SYNC_BYTE, TS_PACKET_SIZE};
 pub use scheduler::Scheduler;
 pub use source::{IterSource, ReadSource, Source};

@@ -17,12 +17,19 @@
 //! Every output slot emits a content packet when the media clock says one is due
 //! and the buffer has it, otherwise a null packet. So a burst is absorbed by the
 //! [`JitterBuffer`] and released at media rate, while the wire stays CBR.
+//!
+//! It also tracks *content liveness* ([`SourceState`]), because stuffing to hold
+//! a rate is the right answer to a late source and the wrong answer to an absent
+//! one. Past the stall timeout the scheduler stops claiming a clock it no longer
+//! has — no PCR is inserted into a stream with no content in it — and the driver
+//! applies [`StallPolicy`](crate::StallPolicy).
 
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, DEFAULT_AUTO_FALLBACK, PcrMode};
 use crate::jitter_buffer::JitterBuffer;
 use crate::null_insertion::{NULL_PID, null_packet, pcr_only_packet};
+use crate::observe::SourceState;
 use crate::packet::{Packet, TS_PACKET_SIZE};
 use crate::pcr::{self, PACKET_BITS, PcrRegen};
 use crate::stats::Stats;
@@ -118,6 +125,12 @@ pub struct Scheduler {
 	/// Wall time of output packet 0 (first enqueue + latency).
 	anchor: Option<Instant>,
 	output_packets: u64,
+	/// Input-silence grace period before the source counts as stalled.
+	stall_timeout: Option<Duration>,
+	/// Wall time content last arrived (after stripping input stuffing).
+	last_content_at: Option<Instant>,
+	/// Whether the input was stalled as of the last output slot.
+	stalled: bool,
 	scratch: Vec<u8>,
 	stats: Stats,
 }
@@ -154,6 +167,9 @@ impl Scheduler {
 			pcr_max_packets: latency_to_packets(config.pcr_max_interval.mul_f64(0.75), bitrate).max(1) as u64,
 			anchor: None,
 			output_packets: 0,
+			stall_timeout: config.stall_timeout,
+			last_content_at: None,
+			stalled: false,
 			scratch: Vec::with_capacity(config.packets_per_datagram.max(1) * TS_PACKET_SIZE),
 			stats: Stats::default(),
 		}
@@ -176,6 +192,11 @@ impl Scheduler {
 			self.anchor = Some(anchor);
 			self.media.anchor = Some(anchor);
 		}
+		if self.stalled {
+			self.resume(now);
+		}
+		self.note_content_gap(now);
+		self.last_content_at = Some(now);
 		if self.pcr_pid.is_none() && packet.has_pcr() {
 			self.pcr_pid = Some(packet.pid());
 		}
@@ -183,6 +204,102 @@ impl Scheduler {
 		if self.buffer.push(packet) {
 			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(1);
 		}
+	}
+
+	/// Restart the media clock after a stall, leaving the output byte clock alone.
+	///
+	/// The media clock kept accruing due packets against a dead source, so without
+	/// this the first datagrams after a stall would find every slot overdue and
+	/// dump the refilled buffer at the mux rate instead of at media rate. The byte
+	/// clock deliberately ran through the gap, so the regenerated PCR stays
+	/// wall-clock-aligned; only the media timeline has a hole in it, which is what
+	/// the discontinuity indicator is for.
+	fn resume(&mut self, now: Instant) {
+		self.stalled = false;
+		let anchor = now + self.latency;
+		self.media.anchor = Some(anchor);
+		self.media.released = 0;
+		// A rate sample taken across the gap would read as the outage length, not
+		// as a media interval; drop the pending one and re-seed on the next PCR.
+		self.media.last_pcr = None;
+		self.media.packets_since_pcr = 0;
+		if let Some(regen) = self.pcr_regen.as_mut() {
+			regen.flag_discontinuity();
+		}
+	}
+
+	/// What the input is currently doing. See [`SourceState`].
+	pub fn state(&self, now: Instant) -> SourceState {
+		let Some(last) = self.last_content_at else {
+			return SourceState::Priming;
+		};
+		if self.anchor.is_some_and(|anchor| now < anchor) {
+			return SourceState::Priming;
+		}
+		// Buffered media is still programme going to air. The input may already be
+		// dead, but the output has not run out of content, so the clock the source
+		// gave us is still worth holding — the stall only begins when the cushion
+		// is spent. It is also what keeps an offline run, where packets are handed
+		// over on a synthetic clock and the file simply ends, from reading as a
+		// stall while it flushes its tail.
+		if !self.buffer.is_empty() {
+			return SourceState::Live;
+		}
+		let silent = now.saturating_duration_since(last);
+		if self.stall_timeout.is_some_and(|timeout| silent >= timeout) {
+			SourceState::Stalled
+		} else if silent >= self.latency {
+			SourceState::Starved
+		} else {
+			SourceState::Live
+		}
+	}
+
+	/// How long the input has carried no content, zero before the first packet.
+	pub fn silent_for(&self, now: Instant) -> Duration {
+		match self.last_content_at {
+			Some(last) => now.saturating_duration_since(last),
+			None => Duration::ZERO,
+		}
+	}
+
+	/// Skip this output slot's worth of packets without emitting them, advancing
+	/// the byte clock across the gap.
+	///
+	/// This is the [`StallPolicy::Mute`](crate::StallPolicy::Mute) path: the wire
+	/// goes quiet so downstream can see the source is gone, while the output index
+	/// keeps counting so a resumed leg's PCR — and any sink numbering derived from
+	/// the output position — picks up where real time says it should.
+	pub fn advance_muted(&mut self, now: Instant) {
+		self.observe_state(now);
+		let packets = self.packets_per_datagram as u64;
+		self.output_packets = self.output_packets.saturating_add(packets);
+		self.stats.muted_packets = self.stats.muted_packets.saturating_add(packets);
+	}
+
+	/// Fold the current state into the stall bookkeeping, returning it.
+	fn observe_state(&mut self, now: Instant) -> SourceState {
+		let state = self.state(now);
+		let stalled = state.is_stalled();
+		if stalled {
+			if !self.stalled {
+				self.stats.stalls = self.stats.stalls.saturating_add(1);
+			}
+			// Track the gap as it grows, so a stall still in progress when the run
+			// ends is reported at its true length rather than not at all.
+			self.note_content_gap(now);
+		}
+		self.stalled = stalled;
+		state
+	}
+
+	/// Record the silence up to `now` as a content gap, keeping the longest.
+	fn note_content_gap(&mut self, now: Instant) {
+		if self.last_content_at.is_none() {
+			return;
+		}
+		let gap = self.silent_for(now).as_millis().min(u128::from(u64::MAX)) as u64;
+		self.stats.content_gap_max_ms = self.stats.content_gap_max_ms.max(gap);
 	}
 
 	/// Wall-clock instant the next output datagram is due, or `None` until the
@@ -212,6 +329,10 @@ impl Scheduler {
 	pub fn emit_datagram(&mut self, now: Instant) -> &[u8] {
 		self.scratch.clear();
 		let due = self.media.due(now);
+		// With no content arriving there is no clock to hold: inserting PCR into a
+		// programme-free carrier is what makes a dead feed look conformant to
+		// everything downstream, so re-insertion stops with the content.
+		let stalled = self.observe_state(now).is_stalled();
 		for _ in 0..self.packets_per_datagram {
 			let index = self.output_packets;
 			let want_content = self.media.released < due;
@@ -233,7 +354,7 @@ impl Scheduler {
 				}
 				self.media.released = self.media.released.saturating_add(1);
 				self.stats.content_packets = self.stats.content_packets.saturating_add(1);
-			} else if let Some(pcr) = self.reinsert_pcr(index) {
+			} else if let Some(pcr) = self.reinsert_pcr(index, stalled) {
 				// A stuffing slot doubles as a re-inserted PCR when the source's
 				// own PCR would otherwise fall past the repetition limit.
 				let packet = pcr_only_packet(self.pcr_pid.expect("pid set"), self.pcr_pid_cc, pcr);
@@ -245,8 +366,9 @@ impl Scheduler {
 				self.stats.null_packets = self.stats.null_packets.saturating_add(1);
 				// A null while content was due but unavailable is a genuine
 				// underrun (input starved); a null while holding the cushion is
-				// ordinary rate stuffing.
-				if want_content {
+				// ordinary rate stuffing. A stalled source is neither: it is
+				// counted as a stall, so it can't hide inside the underrun figure.
+				if want_content && !stalled {
 					self.stats.underruns = self.stats.underruns.saturating_add(1);
 				}
 			}
@@ -257,9 +379,12 @@ impl Scheduler {
 	}
 
 	/// The byte-locked PCR to re-insert at output `index`, or `None` when
-	/// re-insertion doesn't apply: preserve mode, no PCR PID learned yet, no real
-	/// PCR seen yet, or the repetition limit not yet reached.
-	fn reinsert_pcr(&self, index: u64) -> Option<u64> {
+	/// re-insertion doesn't apply: a stalled source, preserve mode, no PCR PID
+	/// learned yet, no real PCR seen yet, or the repetition limit not yet reached.
+	fn reinsert_pcr(&self, index: u64, stalled: bool) -> Option<u64> {
+		if stalled {
+			return None;
+		}
 		let regen = self.pcr_regen.as_ref()?;
 		self.pcr_pid?;
 		let last = self.last_pcr_index?;
@@ -454,6 +579,174 @@ mod tests {
 		sched.enqueue(Packet::from_slice(&null).unwrap(), t0);
 		assert_eq!(sched.stats().input_nulls_stripped, 1);
 		assert_eq!(sched.buffered_packets(), 0, "input nulls are not buffered");
+	}
+
+	#[test]
+	fn state_tracks_content_arrival_not_output() {
+		let cfg = config()
+			.with_latency(Duration::from_millis(10))
+			.with_stall_timeout(Some(Duration::from_millis(200)))
+			.with_packets_per_datagram(1);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+
+		assert_eq!(sched.state(t0), SourceState::Priming, "no input yet");
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+		assert_eq!(sched.state(t0), SourceState::Priming, "still filling the cushion");
+		assert_eq!(sched.state(t0 + Duration::from_millis(11)), SourceState::Live);
+
+		// Drain the one packet, then the buffer is dry with no new input.
+		sched.emit_datagram(t0 + Duration::from_millis(11));
+		assert_eq!(sched.state(t0 + Duration::from_millis(30)), SourceState::Starved);
+		assert_eq!(sched.state(t0 + Duration::from_millis(300)), SourceState::Stalled);
+
+		// Content returning clears the stall outright.
+		sched.emit_datagram(t0 + Duration::from_millis(300));
+		let resumed = t0 + Duration::from_millis(400);
+		sched.enqueue(content_packet(0x100, None), resumed);
+		assert_eq!(sched.state(resumed), SourceState::Live);
+		assert_eq!(sched.stats().stalls, 1, "one stall, not one per output slot");
+		assert!(sched.stats().content_gap_max_ms >= 300);
+	}
+
+	#[test]
+	fn stops_inserting_pcr_when_the_source_stalls() {
+		// The pacer's own PCR insertion is what makes a dead feed look conformant
+		// downstream, so it must stop with the content.
+		let cfg = config()
+			.with_pcr_mode(PcrMode::Regenerate)
+			.with_pcr_max_interval(Duration::from_micros(100))
+			.with_stall_timeout(Some(Duration::from_millis(200)))
+			.with_packets_per_datagram(1);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+
+		let mut now = t0;
+		for _ in 0..5 {
+			sched.emit_datagram(now);
+			now += Duration::from_millis(1);
+		}
+		let live_insertions = sched.stats().pcr_inserted;
+		assert!(live_insertions > 0, "a merely late source still gets its clock held");
+
+		// Past the stall timeout the stream has no clock to hold.
+		now += Duration::from_millis(300);
+		for _ in 0..40 {
+			let datagram = sched.emit_datagram(now).to_vec();
+			assert_eq!(pcr::read_pcr(&datagram), None, "no PCR in a programme-free carrier");
+			now += Duration::from_millis(1);
+		}
+		assert_eq!(sched.stats().pcr_inserted, live_insertions);
+		assert_eq!(sched.stats().stalls, 1);
+		assert_eq!(sched.stats().underruns, 0, "a stall is not counted as an underrun");
+	}
+
+	#[test]
+	fn muted_slots_hold_the_byte_clock_without_emitting() {
+		let cfg = config()
+			.with_stall_timeout(Some(Duration::from_millis(100)))
+			.with_packets_per_datagram(7);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+		// Drain the cushion first: buffered media is still content going to air.
+		sched.emit_datagram(t0);
+		let due_before = sched.next_due().unwrap();
+		let emitted_before = sched.stats().output_packets;
+
+		sched.advance_muted(t0 + Duration::from_millis(200));
+
+		let stats = sched.stats();
+		assert_eq!(stats.output_packets, emitted_before, "nothing reached the sink");
+		assert_eq!(stats.muted_packets, 7);
+		assert_eq!(stats.stalls, 1);
+		// The byte clock still moved one datagram, so the output position (and the
+		// PCR locked to it) stays aligned with real time across the gap.
+		let one_datagram = Duration::from_nanos(7 * 188 * 8 * 1_000_000_000 / MUX_RATE);
+		assert_eq!(sched.next_due().unwrap() - due_before, one_datagram);
+	}
+
+	#[test]
+	fn resume_re_anchors_the_media_clock() {
+		// Two PCRs 1 ms apart carrying one packet each => ~1000 pps media rate.
+		let cfg = config()
+			.with_latency(Duration::from_millis(20))
+			.with_stall_timeout(Some(Duration::from_millis(200)))
+			.with_packets_per_datagram(1);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+		sched.enqueue(content_packet(0x100, Some(27_000)), t0);
+
+		// Release the cushion, then run past the stall timeout with no new input.
+		let mut now = t0 + Duration::from_millis(20);
+		for _ in 0..4 {
+			sched.emit_datagram(now);
+			now += Duration::from_millis(1);
+		}
+		assert_eq!(sched.buffered_packets(), 0, "the cushion is spent");
+		now = t0 + Duration::from_secs(2);
+		sched.advance_muted(now);
+		assert_eq!(sched.stats().stalls, 1);
+
+		// Content returns as a burst, as a reconnecting transport delivers it.
+		for _ in 0..50 {
+			sched.enqueue(content_packet(0x100, None), now);
+		}
+		let released_before = sched.stats().content_packets;
+		for _ in 0..10 {
+			sched.emit_datagram(now);
+			now += Duration::from_micros(150);
+		}
+		assert_eq!(
+			sched.stats().content_packets,
+			released_before,
+			"resume re-primes the cushion instead of dumping the backlog at line rate"
+		);
+
+		// Past the priming window content flows again, still at media rate: 15 ms
+		// of output at ~1000 pps is nowhere near the 50 packets buffered.
+		now += Duration::from_millis(20);
+		for _ in 0..100 {
+			sched.emit_datagram(now);
+			now += Duration::from_micros(150);
+		}
+		let released = sched.stats().content_packets - released_before;
+		assert!(
+			(1..30).contains(&released),
+			"expected a media-rate trickle after resume, got {released} packets"
+		);
+	}
+
+	#[test]
+	fn flags_discontinuity_on_the_first_pcr_after_a_resume() {
+		// The output byte clock ran through the stall, so the emitted PCR is still
+		// monotonic; it is the media timeline that has a hole, and that is what the
+		// discontinuity indicator is for.
+		let cfg = config()
+			.with_pcr_mode(PcrMode::Regenerate)
+			.with_stall_timeout(Some(Duration::from_millis(200)))
+			.with_packets_per_datagram(1);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+		let first = sched.emit_datagram(t0).to_vec();
+		assert_eq!(first[5] & 0x80, 0, "stream start is not a discontinuity");
+
+		let mut now = t0 + Duration::from_secs(2);
+		sched.advance_muted(now);
+		sched.enqueue(content_packet(0x100, Some(54_000_000)), now);
+
+		let mut flagged = false;
+		for _ in 0..40 {
+			let datagram = sched.emit_datagram(now).to_vec();
+			if pid_of(&datagram) == 0x100 && pcr::read_pcr(&datagram).is_some() && datagram[5] & 0x80 != 0 {
+				flagged = true;
+			}
+			now += Duration::from_millis(1);
+		}
+		assert!(flagged, "resumed content carries the discontinuity indicator");
 	}
 
 	#[test]

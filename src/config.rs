@@ -28,6 +28,40 @@ pub enum PcrMode {
 	Regenerate,
 }
 
+/// What the pacer does once its input has been silent for longer than
+/// [`Config::stall_timeout`].
+///
+/// A pacer holds the wire at a constant rate by stuffing null packets, which is
+/// exactly right for absorbing transport jitter and exactly wrong for absorbing
+/// the *absence* of a source: left alone, it emits a byte-perfect carrier — valid
+/// transport, correct rate, PCR present — carrying no programme at all, for as
+/// long as it is left running. Downstream monitoring and 1+1 receivers key on
+/// packet arrival, loss and continuity, all of which read healthy, so a dead feed
+/// looks like a live one. This enum is where that is decided explicitly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StallPolicy {
+	/// Stop emitting while the input is stalled, then resume when content
+	/// returns. The task stays alive and the output byte clock keeps running
+	/// through the gap, so the regenerated PCR is still wall-clock-aligned on
+	/// resume. Downstream sees the carrier stop, which is what an IRD input
+	/// failover or an ST 2022-7 receiver can actually detect.
+	#[default]
+	Mute,
+
+	/// Keep emitting the constant-bitrate carrier through the stall. The output
+	/// stays at rate with no programme in it, so nothing downstream that keys on
+	/// packet arrival can tell the source has gone; use it only where something
+	/// else supervises content liveness and the carrier must not drop. Even here
+	/// the pacer stops inserting its own PCR while stalled, so the stream does not
+	/// claim a clock it no longer has.
+	Continue,
+
+	/// Stop and return [`Error::SourceStalled`](crate::Error::SourceStalled), so a
+	/// supervisor (a process manager, or the gateway that spawned the pacer) makes
+	/// the decision.
+	Fail,
+}
+
 /// The output bitrate target: an explicit constant rate, or one derived
 /// automatically from the source.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -96,6 +130,21 @@ pub struct Config {
 	/// PLL never starves. Ignored under [`PcrMode::Preserve`], which inherits the
 	/// source's PCR cadence untouched.
 	pub pcr_max_interval: Duration,
+
+	/// How long the input may carry no content before the pacer treats it as
+	/// stalled rather than merely jittery, and applies [`Config::stall_policy`].
+	///
+	/// This is grace *on top of* [`Config::latency`], which already covers a gap
+	/// of its own length out of the de-jitter buffer. It must comfortably exceed
+	/// the worst recovery the transport does invisibly — a relay reselect, a
+	/// reconnect — or the pacer will tear down the carrier for the very events it
+	/// exists to absorb. `None` disables stall detection entirely, restoring the
+	/// carrier-forever behaviour with no timeout.
+	pub stall_timeout: Option<Duration>,
+
+	/// What to do once the input has been silent past [`Config::stall_timeout`].
+	/// See [`StallPolicy`].
+	pub stall_policy: StallPolicy,
 }
 
 /// Default packets per output datagram: 7 * 188 = 1316 bytes.
@@ -106,6 +155,13 @@ pub const DEFAULT_LATENCY: Duration = Duration::from_millis(200);
 pub const DEFAULT_MAX_LATENCY: Duration = Duration::from_millis(2_000);
 /// Default maximum PCR repetition interval (TR 101 290 P1 limit).
 pub const DEFAULT_PCR_MAX_INTERVAL: Duration = Duration::from_millis(40);
+/// Default input-silence grace period before the input counts as stalled.
+///
+/// One second is well past any de-jitter cushion and past the sub-second recovery
+/// an IP transport performs on its own (a relay reselect, a reconnect), so it does
+/// not fire on events the pacer is meant to absorb, while still declaring a dead
+/// source inside the window an IRD input-failover would notice.
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 /// Default headroom for [`Bitrate::Auto`]: 15% above the measured content rate.
 pub const DEFAULT_AUTO_HEADROOM: f64 = 0.15;
 /// Fallback output rate for [`Bitrate::Auto`] when the source carries no usable
@@ -140,6 +196,8 @@ impl Config {
 			pcr: PcrMode::default(),
 			packets_per_datagram: DEFAULT_PACKETS_PER_DATAGRAM,
 			pcr_max_interval: DEFAULT_PCR_MAX_INTERVAL,
+			stall_timeout: Some(DEFAULT_STALL_TIMEOUT),
+			stall_policy: StallPolicy::default(),
 		}
 	}
 
@@ -186,6 +244,18 @@ impl Config {
 	/// Set the maximum PCR repetition interval (PCR re-insertion threshold).
 	pub fn with_pcr_max_interval(mut self, interval: Duration) -> Self {
 		self.pcr_max_interval = interval;
+		self
+	}
+
+	/// Set the input-silence grace period, or `None` to disable stall detection.
+	pub fn with_stall_timeout(mut self, timeout: Option<Duration>) -> Self {
+		self.stall_timeout = timeout;
+		self
+	}
+
+	/// Set what happens once the input is stalled. See [`StallPolicy`].
+	pub fn with_stall_policy(mut self, policy: StallPolicy) -> Self {
+		self.stall_policy = policy;
 		self
 	}
 }

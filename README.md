@@ -50,6 +50,10 @@ Every output slot emits a content packet when the media clock says one is due an
 the buffer has it, otherwise a null packet. So a burst is absorbed by a bounded
 jitter buffer and released at media rate, while the wire stays CBR.
 
+A third thing is tracked alongside those clocks: whether content is still
+*arriving*. See [Content liveness](#content-liveness) -- stuffing is the right
+answer to a late source and the wrong answer to an absent one.
+
 ## Quick start
 
 The engine is a `Source` -> pacer -> `Sink` pipeline. Any producer is one
@@ -98,6 +102,8 @@ Build a `Config` with `Config::new(bitrate)` (explicit rate) or `Config::auto()`
 | `.with_pcr_mode(m)` | `PcrMode` | `Regenerate` | How the PCR is handled (see [PCR modes](#pcr-modes)). |
 | `.with_packets_per_datagram(n)` | `usize` | 7 | Packets coalesced per output datagram. 7 * 188 = 1316 bytes fits a 1500-byte MTU over UDP/RTP. |
 | `.with_pcr_max_interval(d)` | `Duration` | 40 ms | Max PCR repetition to hold on the output (TR 101 290 P1 limit). Under `Regenerate`, extra byte-locked PCR-only packets are inserted into stuffing slots when the source PCR is sparser than this. Ignored under `Preserve`. |
+| `.with_stall_timeout(o)` | `Option<Duration>` | 1000 ms | How long the input may carry no content before it counts as gone rather than late. Grace *on top of* `latency`. `None` disables detection (carrier forever). |
+| `.with_stall_policy(p)` | `StallPolicy` | `Mute` | What to do once stalled (see [Content liveness](#content-liveness)). |
 
 ### PCR modes
 
@@ -148,6 +154,59 @@ explicitly. When the source has no usable PCR to measure, auto falls back to
 `DEFAULT_AUTO_FALLBACK` (4 Mb/s). `estimate_content_bitrate(&[Packet])` is exposed
 if you want to measure a run of packets yourself.
 
+## Content liveness
+
+A pacer holds the wire at a constant rate by stuffing null packets. That is
+exactly right when the source is *late* and exactly wrong when the source is
+*gone*: left alone, a pacer whose upstream dies keeps emitting a byte-perfect
+carrier -- valid transport, correct rate, PCR present and accurate -- with no
+programme in it, for as long as it is left running. Every signal a monitor or a
+1+1 receiver normally keys on reads healthy: no loss, no continuity errors, no
+silence. An input-failover policy performs zero switches, because there is never
+any silence to detect. Grooming decouples *carrier* liveness from *content*
+liveness, and only the pacer is positioned to tell them apart.
+
+So the engine tracks when content last **arrived**, not just what it emitted, and
+past `stall_timeout` it treats the source as gone:
+
+- It stops inserting its own PCR. Re-insertion exists to hold the repetition limit
+  for a stream being carried; there is no clock to hold in a stream with no
+  content, and minting one is what makes a dead feed look conformant.
+- It applies `StallPolicy`:
+  - **`Mute`** (default) -- stop emitting, keep the task alive, resume when content
+    returns. The output byte clock keeps running through the gap, so the
+    regenerated PCR is still wall-clock-aligned on the far side and the output
+    position (which a sink may number from) does not lose the outage. Downstream
+    sees the carrier stop, which is what an IRD input failover or an ST 2022-7
+    receiver can actually detect -- and a groomed leg's normal inter-datagram gap
+    is microseconds, so a 50 ms failover threshold is unambiguous.
+  - **`Continue`** -- hold the carrier through the stall, for a plant where the
+    input must not drop and something else supervises content. Still no minted PCR.
+  - **`Fail`** -- return `Error::SourceStalled` and let a supervisor decide.
+
+On resume the media clock is re-anchored (so the refilled buffer is released at
+media rate instead of dumped at line rate) and the first regenerated PCR carries
+the discontinuity indicator, since the media timeline has a hole the output clock
+does not.
+
+`SourceState` is observable while the pacer runs -- the counters alone cannot say
+"starving right now":
+
+```rust
+use mpegts_pacer::{CallbackObserver, Config, Health, pace_with};
+
+let stats = pace_with(Config::new(10_000_000), source, sink,
+    CallbackObserver::new(|health: Health| {
+        if health.source.is_stalled() {
+            eprintln!("source gone: {} ms without content", health.stats.content_gap_max_ms);
+        }
+    }),
+).await?;
+```
+
+`TsPacer` exposes the same thing as a snapshot (`health()`) or a channel to await
+on (`watch_health()`).
+
 ## Sources and sinks
 
 Built-in `Source`s:
@@ -174,9 +233,15 @@ receiver, an ST 2022-7 pair, an FEC path) without touching the engine.
 
 `output_packets`, `content_packets`, `null_packets`, `dropped_packets` (buffer at
 `max_latency`), `input_nulls_stripped` (source padding replaced by our own),
-`underruns` (buffer starved), `pcr_rebases` (source discontinuities),
-`pcr_inserted` (byte-locked PCR-only packets added to hold the repetition limit),
-and `null_ratio()`.
+`underruns` (buffer starved while the input was still live), `pcr_rebases` (source
+discontinuities), `pcr_inserted` (byte-locked PCR-only packets added to hold the
+repetition limit), `stalls` (times the input went away), `muted_packets` (output
+slots skipped while stalled, i.e. the carrier gap), `content_gap_max_ms` (longest
+silence), and `null_ratio()`.
+
+`stalls` is the one counter no amount of output inspection can substitute for: a
+run that reports zero loss, zero drops and a healthy bitrate may still have spent
+most of its life carrying nothing.
 
 ## Examples
 
@@ -218,6 +283,7 @@ ffplay -i 'udp://@239.0.0.1:5000'   # or point your IRD at the group
 
 ```text
 moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--latency-ms N]
+           [--max-latency-ms N] [--ssrc N] [--stall-ms N] [--on-stall mute|continue|fail]
 ```
 
 - `<-|stdout|dest_ip:port>` -- `-` or `stdout` to write raw TS to a pipe, or a
@@ -227,6 +293,10 @@ moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--la
 - `--preserve` -- keep source PCR values (`PcrMode::Preserve`) instead of
   regenerating them. Use for soft players, not hardware IRDs.
 - `--latency-ms N` -- de-jitter priming latency (default 200).
+- `--stall-ms N` -- input-silence grace before the source counts as gone (default
+  1000; `0` disables detection).
+- `--on-stall mute|continue|fail` -- what to do then (default `mute`). Transitions
+  are logged to stderr either way.
 
 ### ffplay and "RTP: dropping old packet received too late"
 

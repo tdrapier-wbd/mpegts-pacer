@@ -1,5 +1,7 @@
 //! Error and result types for the pacer.
 
+use std::time::Duration;
+
 /// Errors surfaced by [`crate`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -17,6 +19,17 @@ pub enum Error {
 	/// for the underlying cause.
 	#[error("pacer output task has stopped")]
 	Closed,
+
+	/// The source delivered no content for longer than
+	/// [`Config::stall_timeout`](crate::Config::stall_timeout), under
+	/// [`StallPolicy::Fail`](crate::StallPolicy::Fail). A stalled source is not an
+	/// I/O error: the transport is usually still open and simply silent, which is
+	/// why it needs its own variant.
+	#[error("source stalled: no content for {silent_for:?}")]
+	SourceStalled {
+		/// How long the input had been silent when the pacer gave up.
+		silent_for: Duration,
+	},
 }
 
 /// Convenience alias for a [`Result`](std::result::Result) with this crate's [`Error`].

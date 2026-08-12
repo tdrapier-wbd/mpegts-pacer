@@ -107,6 +107,8 @@ pub struct PcrRegen {
 	anchor: Option<(u64, u64)>,
 	/// Last source PCR observed, used to detect discontinuities.
 	last_src: Option<u64>,
+	/// Flag the next rewritten PCR as discontinuous without moving the anchor.
+	flag_next: bool,
 }
 
 impl PcrRegen {
@@ -116,14 +118,30 @@ impl PcrRegen {
 			mux_rate_bps: mux_rate_bps.max(1),
 			anchor: None,
 			last_src: None,
+			flag_next: false,
 		}
+	}
+
+	/// Mark the next PCR-bearing packet as discontinuous, leaving the byte-locked
+	/// anchor alone.
+	///
+	/// Used when the *media* timeline has a hole the output clock does not: after
+	/// an input stall, the emitted PCR is still byte-locked and monotonic (the
+	/// output byte clock ran through the gap), but the resumed content's PTS no
+	/// longer sits where the decoder's buffer model expects. Re-basing the anchor
+	/// instead would step the PCR backwards by the length of the outage, which no
+	/// IRD absorbs cleanly; the discontinuity indicator says the same thing
+	/// without breaking the clock.
+	pub fn flag_discontinuity(&mut self) {
+		self.flag_next = true;
 	}
 
 	/// Rewrite the PCR carried by `packet` (which sits at output byte position
 	/// `output_index`) to its byte-locked value, in place. A no-op on a packet
 	/// with no PCR. Returns `true` if this packet re-based the anchor (a genuine
-	/// source discontinuity), so the caller can bump the re-base stat; the
-	/// discontinuity indicator is set here regardless.
+	/// source discontinuity), so the caller can bump the re-base stat. The
+	/// discontinuity indicator is set on a re-base and on a pending
+	/// [`flag_discontinuity`](PcrRegen::flag_discontinuity).
 	pub fn rewrite(&mut self, packet: &mut [u8], output_index: u64) -> bool {
 		let Some(src) = read_pcr(packet) else {
 			return false;
@@ -153,7 +171,10 @@ impl PcrRegen {
 		let pcr_out = (anchor_pcr + ticks) % PCR_WRAP_TICKS;
 
 		write_pcr(&mut packet[6..12], pcr_out);
-		set_discontinuity_indicator_if(packet, rebased);
+		// A re-base and a flagged media hole are the same signal downstream; only
+		// a re-base is a source discontinuity the caller counts.
+		let flagged = std::mem::take(&mut self.flag_next);
+		set_discontinuity_indicator_if(packet, rebased || flagged);
 		rebased
 	}
 

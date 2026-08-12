@@ -17,6 +17,17 @@ use crate::packet::{Packet, TS_PACKET_SIZE};
 /// [`recv`](Source::recv) yields the next packet, or `Ok(None)` once the source
 /// is exhausted (which tells the pacer to flush its buffer and finish). The
 /// returned future is `Send` so the pacer can run on a spawned task.
+///
+/// `recv` must be **cancel-safe**: the pacer races it against the output byte
+/// clock and against the stall timeout, so the future is dropped and remade
+/// constantly, and an implementation that buffers progress inside the future
+/// rather than in `self` will lose bytes. [`ReadSource`] keeps its partial packet
+/// in a field for exactly this reason.
+///
+/// Note that `Ok(None)` is the *clean* end of input. A source that simply stops
+/// delivering — a killed publisher behind a pipe that stays open — never reports
+/// anything at all, which is why the pacer times silence out rather than trusting
+/// this signal alone (see [`StallPolicy`](crate::StallPolicy)).
 pub trait Source {
 	/// Pull the next packet, or `Ok(None)` at end of input.
 	fn recv(&mut self) -> impl Future<Output = Result<Option<Packet>>> + Send;

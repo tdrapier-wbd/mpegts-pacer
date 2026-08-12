@@ -7,6 +7,10 @@
 /// input sustained a rate above the configured bitrate (or burst past
 /// `max_latency`), and a climbing `underruns` means the input starved the buffer
 /// so null packets were sent to hold the rate.
+///
+/// `stalls` and `muted_packets` are the content-liveness counters: they say the
+/// source stopped delivering altogether, which no other counter here can express
+/// (an output holding its rate on pure stuffing looks identical to a healthy one).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
 	/// Total 188-byte packets written to the sink (content + null).
@@ -20,12 +24,27 @@ pub struct Stats {
 	/// Input null/stuffing packets stripped at ingest (their padding is replaced
 	/// by the pacer's own rate stuffing).
 	pub input_nulls_stripped: u64,
-	/// Output slots that emitted a null because the buffer was empty (starved).
+	/// Output slots that emitted a null because the buffer was empty (starved)
+	/// while the input was still live. Slots skipped under a stall are counted by
+	/// `muted_packets` instead: a starved buffer and an absent source are
+	/// different faults and conflating them hides both.
 	pub underruns: u64,
 	/// PCR anchor re-bases from a genuine source discontinuity (>5 s PCR jump).
 	pub pcr_rebases: u64,
 	/// Byte-locked PCR-only packets inserted to hold the repetition limit.
 	pub pcr_inserted: u64,
+	/// Times the input went silent past
+	/// [`Config::stall_timeout`](crate::Config::stall_timeout). A non-zero value
+	/// means the source died (or paused) at least once, whatever the carrier
+	/// looked like.
+	pub stalls: u64,
+	/// Output slots not emitted because the input was stalled (under
+	/// [`StallPolicy::Mute`](crate::StallPolicy::Mute)). The output byte clock
+	/// still advanced across them, so this is the length of the carrier gap in
+	/// 188-byte packets.
+	pub muted_packets: u64,
+	/// Longest interval, in milliseconds, that the input carried no content.
+	pub content_gap_max_ms: u64,
 }
 
 impl Stats {
