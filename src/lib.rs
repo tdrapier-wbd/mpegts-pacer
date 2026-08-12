@@ -64,6 +64,17 @@
 //! holding the output byte clock, and resumes when content returns.
 //! [`SourceState`] is observable while the pacer runs, via
 //! [`TsPacer::watch_health`] or [`pace_with`].
+//!
+//! # Redundant pairs
+//!
+//! By default the pacer decides what goes in each output slot from its own emit
+//! clock, which is correct for one output and wrong for two: an ST 2022-7
+//! receiver merges a pair by matching RTP sequence numbers and expects the legs
+//! to be packet-identical, and two pacers clocked on their own emit instants are
+//! not. [`Clocking::Stream`] places every packet on the absolute slot its source
+//! PCR implies, and numbers the output from that slot, so what a leg sends is a
+//! function of the stream rather than of the leg — two of them agree without
+//! sharing a process, and one can join, leave and rejoin the pair on its own.
 
 mod config;
 mod error;
@@ -76,18 +87,19 @@ mod pacer;
 mod packet;
 mod pcr;
 mod scheduler;
+mod slot;
 mod source;
 mod stats;
 
 pub use config::{
-	Bitrate, Config, DEFAULT_AUTO_FALLBACK, DEFAULT_AUTO_HEADROOM, DEFAULT_LATENCY, DEFAULT_MAX_LATENCY,
+	Bitrate, Clocking, Config, DEFAULT_AUTO_FALLBACK, DEFAULT_AUTO_HEADROOM, DEFAULT_LATENCY, DEFAULT_MAX_LATENCY,
 	DEFAULT_PACKETS_PER_DATAGRAM, DEFAULT_STALL_TIMEOUT, PcrMode, StallPolicy,
 };
 pub use error::{Error, Result};
 pub use estimate::estimate_content_bitrate;
 pub use null_insertion::NULL_PID;
 pub use observe::{CallbackObserver, Health, Observer, SourceState};
-pub use output::{CallbackSink, RTP_PAYLOAD_TYPE_MP2T, RtpSink, Sink, UdpSink, WriteSink};
+pub use output::{CallbackSink, Framing, RTP_PAYLOAD_TYPE_MP2T, RtpSink, Sink, UdpSink, WriteSink};
 pub use pacer::{TsPacer, pace, pace_with};
 pub use packet::{Packet, SYNC_BYTE, TS_PACKET_SIZE};
 pub use scheduler::Scheduler;

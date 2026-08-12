@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::error::Error;
+
 /// How the pacer treats the PCR (Program Clock Reference) already present in the
 /// input.
 ///
@@ -60,6 +62,39 @@ pub enum StallPolicy {
 	/// supervisor (a process manager, or the gateway that spawned the pacer) makes
 	/// the decision.
 	Fail,
+}
+
+/// What decides *which* packet occupies each output slot.
+///
+/// Both modes hold the wire at the configured constant rate, and in both the wall
+/// clock decides *when* a slot is transmitted. They differ in whether the wall
+/// clock also decides *what* goes in it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Clocking {
+	/// Release content at the media rate recovered from the source PCR, measured
+	/// against the pacer's own emit clock, and stuff the remaining slots.
+	///
+	/// Correct for a single output, and the mode every published measurement in
+	/// this crate was made in. Its content/stuffing interleave depends on the
+	/// instant each datagram is emitted, so two pacers fed the same input over
+	/// independent paths produce different — though individually valid — output.
+	#[default]
+	Arrival,
+
+	/// Place every packet on the absolute slot its source PCR implies at the
+	/// locked mux rate, independent of arrival time, start time and emit jitter.
+	///
+	/// Two pacers in this mode fed the same objects emit the same bytes in the
+	/// same slots, which is what an ST 2022-7 receiver needs from a redundant
+	/// pair built out of two independent chains. It also makes a leg's numbering
+	/// a property of the stream rather than of the leg, so one that starts late,
+	/// or stops and returns, lands on the grid its partner is already using.
+	///
+	/// Requires [`Bitrate::Constant`] — an auto rate measured from an arrival
+	/// window is exactly the kind of per-process quantity this mode exists to
+	/// remove — and [`PcrMode::Regenerate`], since the emitted PCR *is* the slot
+	/// position. The source must carry PCR; without it there is no grid.
+	Stream,
 }
 
 /// The output bitrate target: an explicit constant rate, or one derived
@@ -145,6 +180,15 @@ pub struct Config {
 	/// What to do once the input has been silent past [`Config::stall_timeout`].
 	/// See [`StallPolicy`].
 	pub stall_policy: StallPolicy,
+
+	/// What decides which packet occupies each output slot. See [`Clocking`].
+	pub clocking: Clocking,
+
+	/// Added to the slot-derived RTP sequence number in [`Clocking::Stream`], so
+	/// a pair can be offset as a whole without either leg's numbering ceasing to
+	/// be a function of stream position. Both legs of a pair must use the same
+	/// seed. Ignored in [`Clocking::Arrival`].
+	pub sequence_seed: u16,
 }
 
 /// Default packets per output datagram: 7 * 188 = 1316 bytes.
@@ -198,6 +242,8 @@ impl Config {
 			pcr_max_interval: DEFAULT_PCR_MAX_INTERVAL,
 			stall_timeout: Some(DEFAULT_STALL_TIMEOUT),
 			stall_policy: StallPolicy::default(),
+			clocking: Clocking::default(),
+			sequence_seed: 0,
 		}
 	}
 
@@ -257,5 +303,41 @@ impl Config {
 	pub fn with_stall_policy(mut self, policy: StallPolicy) -> Self {
 		self.stall_policy = policy;
 		self
+	}
+
+	/// Set what decides which packet occupies each output slot. See [`Clocking`].
+	pub fn with_clocking(mut self, clocking: Clocking) -> Self {
+		self.clocking = clocking;
+		self
+	}
+
+	/// Set the RTP sequence seed used in [`Clocking::Stream`].
+	pub fn with_sequence_seed(mut self, seed: u16) -> Self {
+		self.sequence_seed = seed;
+		self
+	}
+
+	/// Reject combinations that cannot deliver what the mode promises.
+	///
+	/// [`Clocking::Stream`] exists so that two independent pacers agree; a rate
+	/// measured per process, or a PCR left at its source value, would make the
+	/// output depend on the process again. Failing here is better than emitting
+	/// something that looks right and does not merge.
+	pub fn validate(&self) -> Result<(), Error> {
+		if self.clocking != Clocking::Stream {
+			return Ok(());
+		}
+		if self.resolved_bitrate().is_none() {
+			return Err(Error::Config(
+				"stream clocking needs an explicit constant bitrate: an auto rate is measured \
+				 from one process's arrival window, so two legs would lock different grids",
+			));
+		}
+		if self.pcr != PcrMode::Regenerate {
+			return Err(Error::Config(
+				"stream clocking needs PcrMode::Regenerate: the emitted PCR is the slot position",
+			));
+		}
+		Ok(())
 	}
 }

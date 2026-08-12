@@ -65,6 +65,8 @@ where
 	Snk: Sink,
 	Obs: Observer,
 {
+	config.validate()?;
+
 	// Resolve an auto-rate config against a short measurement window, then run
 	// the fixed-rate scheduler. Warm-up packets prime the de-jitter buffer.
 	let (config, warmup) = match config.bitrate {
@@ -135,6 +137,12 @@ where
 						return Err(Error::SourceStalled { silent_for: scheduler.silent_for(now) });
 					}
 					_ => {
+						// Offered before the bytes, so a sink that numbers its
+						// output numbers it from the stream rather than from its
+						// own send count.
+						if let Some(framing) = scheduler.framing() {
+							sink.set_framing(framing);
+						}
 						let datagram = scheduler.emit_datagram(now);
 						sink.send(datagram).await?;
 					}
@@ -144,7 +152,12 @@ where
 			maybe = source.recv(), if !closing => {
 				match maybe? {
 					Some(packet) => scheduler.enqueue(packet, tokio_instant::now_std()),
-					None => closing = true,
+					None => {
+						// Stream clocking holds the tail of the stream back waiting
+						// for a closing PCR that is not coming.
+						scheduler.flush();
+						closing = true;
+					}
 				}
 			}
 		}

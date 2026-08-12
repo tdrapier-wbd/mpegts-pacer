@@ -16,6 +16,23 @@ use tokio::net::UdpSocket;
 
 use crate::error::Result;
 
+/// Where the next datagram sits in the stream, for sinks that number their
+/// output.
+///
+/// Under [`Clocking::Stream`](crate::Clocking) these are functions of stream
+/// position rather than of how many datagrams this process has sent, which is
+/// what lets a leg that starts late — or stops and returns — carry the same
+/// numbers as the leg it is protecting. A sink is free to ignore them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Framing {
+	/// Absolute index of the datagram's first 188-byte packet on the output grid.
+	pub slot: u64,
+	/// RTP sequence number for this datagram.
+	pub sequence: u16,
+	/// RTP timestamp for this datagram, on the 90 kHz clock.
+	pub timestamp_90khz: u32,
+}
+
 /// An asynchronous sink for paced MPEG-TS datagrams.
 ///
 /// Each call receives one datagram (a whole number of 188-byte packets). The
@@ -23,6 +40,14 @@ use crate::error::Result;
 pub trait Sink {
 	/// Send one datagram of transport packets.
 	fn send(&mut self, datagram: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+	/// Offered before each [`send`](Sink::send) with the position of the datagram
+	/// about to be sent. Sinks that do not number their output ignore it, which
+	/// is the default.
+	///
+	/// Deliberately synchronous, so implementing it does not drag a sink into the
+	/// async signature of `send`.
+	fn set_framing(&mut self, _framing: Framing) {}
 }
 
 /// A [`Sink`] over any [`AsyncWrite`], writing the raw transport bytes.
@@ -82,14 +107,22 @@ const RTP_HEADER_SIZE: usize = 12;
 const RTP_VERSION: u8 = 2;
 
 /// Wraps each datagram in an RTP header (RFC 2250 MPEG-TS carriage) and sends it
-/// over UDP. Sequence numbers increment per datagram and wrap; the 90 kHz
-/// timestamp is sampled from a monotonic start instant.
+/// over UDP.
+///
+/// By default sequence numbers count the datagrams this sink has sent and the
+/// 90 kHz timestamp is sampled from a monotonic start instant — both properties
+/// of the process, not of the stream. When the pacer supplies a [`Framing`]
+/// (under [`Clocking::Stream`](crate::Clocking)) that is used instead, so a leg
+/// that has sent nothing for ten seconds still resumes on the number its partner
+/// has reached.
 pub struct RtpSink {
 	socket: UdpSocket,
 	destination: SocketAddr,
 	sequence: u16,
 	ssrc: u32,
 	started_at: Instant,
+	/// Position supplied by the pacer for the next datagram, if any.
+	framing: Option<Framing>,
 	scratch: Vec<u8>,
 }
 
@@ -107,16 +140,26 @@ impl RtpSink {
 			sequence: 0,
 			ssrc,
 			started_at: Instant::now(),
+			framing: None,
 			scratch: Vec::with_capacity(RTP_HEADER_SIZE + 1316),
 		}
 	}
 }
 
 impl Sink for RtpSink {
+	fn set_framing(&mut self, framing: Framing) {
+		self.framing = Some(framing);
+	}
+
 	async fn send(&mut self, datagram: &[u8]) -> Result<()> {
-		let sequence = self.sequence;
-		self.sequence = self.sequence.wrapping_add(1);
-		let timestamp = rtp_timestamp_90khz(self.started_at);
+		let (sequence, timestamp) = match self.framing {
+			Some(framing) => (framing.sequence, framing.timestamp_90khz),
+			None => {
+				let sequence = self.sequence;
+				self.sequence = self.sequence.wrapping_add(1);
+				(sequence, rtp_timestamp_90khz(self.started_at))
+			}
+		};
 
 		self.scratch.clear();
 		self.scratch.extend_from_slice(&[0; RTP_HEADER_SIZE]);

@@ -11,9 +11,12 @@
 //! moq ... export ts | dual_rtp 127.0.0.1:5100 127.0.0.1:5200 auto --ssrc 1 --seq 0
 //! ```
 //!
-//! This protects the paths to the receiver, not the chain upstream of the groomer;
-//! a pair fed by two independent chains needs a deterministic, stream-clocked
-//! pacer instead.
+//! This protects the paths to the receiver, not the chain upstream of the groomer:
+//! one process holds both legs, so anything that stops it stops the pair. To
+//! protect the chain as well, run one pacer per leg under
+//! [`Clocking::Stream`](mpegts_pacer::Clocking) — `moq_egress --rtp
+//! --stream-clock` — where each leg's bytes and numbering are a function of the
+//! stream rather than of the process, so the two agree without sharing one.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};

@@ -178,6 +178,23 @@ impl PcrRegen {
 		rebased
 	}
 
+	/// Rewrite a packet's PCR to an explicitly supplied value.
+	///
+	/// For [`Clocking::Stream`](crate::Clocking), where the value comes from the
+	/// output slot rather than from an anchor this regenerator maintains. There is
+	/// no re-base to report: the mapping carries no history, so a source
+	/// discontinuity moves the grid rather than the anchor. The pending
+	/// [`flag_discontinuity`](PcrRegen::flag_discontinuity) still applies, since
+	/// the *media* timeline can have a hole the output clock does not.
+	pub fn rewrite_absolute(&mut self, packet: &mut [u8], pcr: u64) {
+		if read_pcr(packet).is_none() {
+			return;
+		}
+		write_pcr(&mut packet[6..12], pcr % PCR_WRAP_TICKS);
+		let flagged = std::mem::take(&mut self.flag_next);
+		set_discontinuity_indicator_if(packet, flagged);
+	}
+
 	/// The byte-locked PCR for a synthetic packet at `output_index`, using the
 	/// current anchor without disturbing the regenerator's state. Used for PCR
 	/// re-insertion. `None` before the first real PCR has set the anchor.

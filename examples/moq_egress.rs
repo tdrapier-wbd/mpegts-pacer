@@ -21,14 +21,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use mpegts_pacer::{
-	CallbackObserver, Config, Health, PcrMode, ReadSource, RtpSink, SourceState, StallPolicy, Stats, UdpSink,
+	CallbackObserver, Clocking, Config, Health, PcrMode, ReadSource, RtpSink, SourceState, StallPolicy, Stats, UdpSink,
 	WriteSink, pace_with,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let mut args = std::env::args().skip(1);
-	let usage = "usage: moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--latency-ms N] [--max-latency-ms N] [--ssrc N] [--stall-ms N] [--on-stall mute|continue|fail]";
+	let usage = "usage: moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--latency-ms N] [--max-latency-ms N] [--ssrc N] [--stall-ms N] [--on-stall mute|continue|fail] [--stream-clock] [--sequence-seed N]";
 	let dest = args.next().expect(usage);
 	let rate = args.next().expect(usage);
 
@@ -39,6 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let mut ssrc = None;
 	let mut stall_timeout = None;
 	let mut stall_policy = None;
+	let mut clocking = Clocking::Arrival;
+	let mut sequence_seed = 0;
 	let mut rest = args.peekable();
 	while let Some(arg) = rest.next() {
 		match arg.as_str() {
@@ -67,6 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 					other => panic!("unknown stall policy {other:?}; expected mute, continue or fail"),
 				});
 			}
+			// Place packets by stream position rather than by arrival, so two
+			// instances fed the same objects emit the same bytes in the same slots
+			// and an ST 2022-7 receiver can merge them. Needs an explicit bitrate.
+			"--stream-clock" => clocking = Clocking::Stream,
+			"--sequence-seed" => {
+				sequence_seed = rest.next().expect("--sequence-seed needs a value").parse::<u16>()?;
+			}
 			other => panic!("unknown argument {other:?}; {usage}"),
 		}
 	}
@@ -78,7 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		Config::new(rate.parse().expect("bitrate must be an integer or \"auto\""))
 	}
 	.with_latency(latency)
-	.with_pcr_mode(pcr);
+	.with_pcr_mode(pcr)
+	.with_clocking(clocking)
+	.with_sequence_seed(sequence_seed);
 	if let Some(max) = max_latency {
 		config = config.with_max_latency(max);
 	}
@@ -89,15 +100,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		config = config.with_stall_policy(policy);
 	}
 
+	// A refused config is better than output that looks fine and does not merge.
+	config.validate()?;
+
 	let pcr_desc = if pcr == PcrMode::Regenerate {
 		"regenerate PCR"
 	} else {
 		"preserve PCR"
 	};
+	let clock_desc = match clocking {
+		Clocking::Stream => ", stream-clocked",
+		Clocking::Arrival => "",
+	};
 
 	let stats = if dest == "-" || dest == "stdout" {
 		eprintln!(
-			"mpegts-pacer: -> stdout (raw ts) @ {rate} b/s, {pcr_desc}, {} ms latency",
+			"mpegts-pacer: -> stdout (raw ts) @ {rate} b/s, {pcr_desc}{clock_desc}, {} ms latency",
 			latency.as_millis()
 		);
 		pace_with(config, source, WriteSink::new(tokio::io::stdout()), liveness()).await?
@@ -105,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		let destination: SocketAddr = dest.parse().expect("dest must be ip:port, - or stdout");
 		let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
 		eprintln!(
-			"mpegts-pacer: -> {}{destination} @ {rate} b/s, {pcr_desc}, {} ms latency",
+			"mpegts-pacer: -> {}{destination} @ {rate} b/s, {pcr_desc}{clock_desc}, {} ms latency",
 			if rtp { "rtp://" } else { "udp://" },
 			latency.as_millis(),
 		);
@@ -148,7 +166,7 @@ fn liveness() -> CallbackObserver<impl FnMut(Health) + Send> {
 fn report(stats: &Stats) {
 	eprintln!(
 		"mpegts-pacer: done. output_packets={} content={} null={} ({:.1}% stuffing) \
-		 pcr_inserted={} stripped_nulls={} dropped={} underruns={} \
+		 pcr_inserted={} stripped_nulls={} dropped={} late_drops={} underruns={} \
 		 stalls={} muted={} max_content_gap={} ms",
 		stats.output_packets,
 		stats.content_packets,
@@ -157,6 +175,7 @@ fn report(stats: &Stats) {
 		stats.pcr_inserted,
 		stats.input_nulls_stripped,
 		stats.dropped_packets,
+		stats.late_drops,
 		stats.underruns,
 		stats.stalls,
 		stats.muted_packets,

@@ -20,6 +20,12 @@ pub enum Error {
 	#[error("pacer output task has stopped")]
 	Closed,
 
+	/// A [`Config`](crate::Config) asks for something the mode cannot deliver —
+	/// checked by [`Config::validate`](crate::Config::validate) before a run
+	/// starts, rather than discovered as output that does not merge.
+	#[error("invalid configuration: {0}")]
+	Config(&'static str),
+
 	/// The source delivered no content for longer than
 	/// [`Config::stall_timeout`](crate::Config::stall_timeout), under
 	/// [`StallPolicy::Fail`](crate::StallPolicy::Fail). A stalled source is not an

@@ -45,6 +45,16 @@ pub struct Stats {
 	pub muted_packets: u64,
 	/// Longest interval, in milliseconds, that the input carried no content.
 	pub content_gap_max_ms: u64,
+	/// Packets discarded under [`Clocking::Stream`](crate::Clocking) because
+	/// their output slot had already been transmitted.
+	///
+	/// The alternative — emitting them in the next free slot — would make their
+	/// position depend on how late they were, which is precisely the per-process
+	/// variation stream clocking exists to remove. A climbing count means the
+	/// release latency is too short for the path's jitter, not that the pair has
+	/// diverged: both legs drop by slot, so a leg that receives the packet in time
+	/// simply covers for one that did not.
+	pub late_drops: u64,
 }
 
 impl Stats {

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mpegts_pacer::{
-	CallbackObserver, Config, Error, Health, IterSource, Packet, PcrMode, Result, Sink, SourceState, StallPolicy,
-	TS_PACKET_SIZE, pace, pace_with,
+	CallbackObserver, Clocking, Config, Error, Framing, Health, IterSource, Packet, PcrMode, Result, Sink, SourceState,
+	StallPolicy, TS_PACKET_SIZE, pace, pace_with,
 };
 
 const MUX_RATE: u64 = 10_000_000;
@@ -51,6 +51,83 @@ impl Sink for StampedSink {
 		let at = self.start.elapsed();
 		self.sent.lock().unwrap().push((at, datagram.to_vec()));
 		Ok(())
+	}
+}
+
+/// Datagrams recorded with the RTP sequence number each went out under, which is
+/// what a receiver merges a redundant pair on.
+type Numbered = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
+
+/// A `Sink` that records what it sent and under what number.
+///
+/// Where the pacer offers framing, that is the number; otherwise the sink counts
+/// its own sends, as `RtpSink` does.
+struct FramedSink {
+	sent: Numbered,
+	framing: Option<Framing>,
+	count: u16,
+}
+
+impl FramedSink {
+	fn new(sent: Numbered) -> Self {
+		Self {
+			sent,
+			framing: None,
+			count: 0,
+		}
+	}
+}
+
+impl Sink for FramedSink {
+	fn set_framing(&mut self, framing: Framing) {
+		self.framing = Some(framing);
+	}
+
+	async fn send(&mut self, datagram: &[u8]) -> Result<()> {
+		let sequence = match self.framing.take() {
+			Some(framing) => framing.sequence,
+			None => self.count,
+		};
+		self.count = self.count.wrapping_add(1);
+		self.sent.lock().unwrap().push((sequence, datagram.to_vec()));
+		Ok(())
+	}
+}
+
+/// A source that hands over its packets in chunks, pausing between them: a path
+/// that delivers the same objects as its partner, but not at the same times.
+struct BurstySource {
+	packets: std::vec::IntoIter<Packet>,
+	chunk: usize,
+	gap: Duration,
+	remaining: usize,
+	next_burst: Option<tokio::time::Instant>,
+}
+
+impl BurstySource {
+	fn new(packets: Vec<Packet>, chunk: usize, gap: Duration) -> Self {
+		Self {
+			packets: packets.into_iter(),
+			chunk,
+			gap,
+			remaining: chunk,
+			next_burst: None,
+		}
+	}
+}
+
+impl mpegts_pacer::Source for BurstySource {
+	async fn recv(&mut self) -> Result<Option<Packet>> {
+		if self.remaining == 0 {
+			let deadline = *self
+				.next_burst
+				.get_or_insert_with(|| tokio::time::Instant::now() + self.gap);
+			tokio::time::sleep_until(deadline).await;
+			self.next_burst = None;
+			self.remaining = self.chunk;
+		}
+		self.remaining -= 1;
+		Ok(self.packets.next())
 	}
 }
 
@@ -524,6 +601,62 @@ async fn continue_policy_holds_the_carrier_but_stops_claiming_a_clock() {
 		for packet in datagram.chunks_exact(TS_PACKET_SIZE) {
 			assert_eq!(pid(packet), mpegts_pacer::NULL_PID, "only stuffing remains");
 			assert!(!carries_pcr(packet), "a programme-free carrier claims no clock");
+		}
+	}
+}
+
+/// Pace `input` through the real engine down a path that delivers it in bursts,
+/// and return each datagram with the RTP sequence number it went out under.
+async fn leg(config: Config, input: Vec<Packet>) -> Vec<(u16, Vec<u8>)> {
+	let sent: Numbered = Arc::new(Mutex::new(Vec::new()));
+	pace_with(
+		config,
+		BurstySource::new(input, 200, Duration::from_millis(30)),
+		FramedSink::new(sent.clone()),
+		CallbackObserver::new(|_| {}),
+	)
+	.await
+	.unwrap();
+	let sent = sent.lock().unwrap();
+	sent.clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_clocked_leg_joins_the_transport_its_partner_is_sending() {
+	// The end-to-end form of what Arm D is for, through the real engine rather
+	// than the scheduler alone. One leg has been running from the start; the
+	// other picks the stream up part-way, as a leg restored after maintenance
+	// does. Under stream clocking the newcomer emits the partner's bytes under
+	// the partner's numbering without the two having been co-started, or having
+	// exchanged anything at all.
+	//
+	// Emit-time jitter is the other half of the property, and cannot be shown
+	// here: tokio's paused clock fires every timer exactly on time. The scheduler
+	// tests model it directly, with an arrival-clocked control that diverges.
+	let input = media_stream(1_200, 5_000_000, 20);
+	let config = Config::new(MUX_RATE)
+		.with_latency(Duration::from_millis(200))
+		.with_clocking(Clocking::Stream);
+	assert!(config.validate().is_ok());
+
+	let running = leg(config, input.clone()).await;
+	// Cut on a PCR, since that is where a run — and so a subscription — begins.
+	let joined = leg(config, input[400..].to_vec()).await;
+
+	assert!(running.len() > 200, "the leg emitted almost nothing");
+	assert!(joined.len() > 100, "the late leg emitted almost nothing");
+	assert!(
+		joined.len() < running.len(),
+		"the late leg cannot have emitted the whole stream"
+	);
+
+	let running: std::collections::HashMap<_, _> = running.into_iter().collect();
+	// The datagram the leg joined inside is partial: it is short the content its
+	// partner already had when it arrived. Everything after it must match.
+	for (sequence, datagram) in joined.into_iter().skip(1) {
+		match running.get(&sequence) {
+			Some(theirs) => assert_eq!(&datagram, theirs, "sequence {sequence} differs between the legs"),
+			None => panic!("the late leg sent sequence {sequence}, which its partner never used"),
 		}
 	}
 }

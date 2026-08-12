@@ -207,6 +207,52 @@ let stats = pace_with(Config::new(10_000_000), source, sink,
 `TsPacer` exposes the same thing as a snapshot (`health()`) or a channel to await
 on (`watch_health()`).
 
+## Clocking: whose clock decides what goes in each slot
+
+Both modes hold the wire at the configured rate; they differ in what decides
+which packet occupies each output slot.
+
+- **`Clocking::Arrival`** (default) releases content at the media rate recovered
+  from the source PCR, measured against this process's own emit clock. Correct
+  for a single output, and the mode every measurement in this crate was made in.
+- **`Clocking::Stream`** places every packet on the absolute slot its source PCR
+  implies at the locked mux rate. Where a packet goes -- and what number it goes
+  out under -- is a function of the delivered bytes and nothing else: not the
+  start time, not the buffer depth, not how the OS scheduled the emit timer.
+
+The difference only matters when there are two of you. An ST 2022-7 receiver
+merges a redundant pair by matching RTP sequence numbers and expects the legs to
+be packet-identical, so two arrival-clocked pacers fed the same source over
+independent paths produce two individually valid streams that are not a pair:
+their content/stuffing interleave follows their own emit instants. The usual
+answer is to groom once and duplicate the bytes (the `dual_rtp` example), which
+protects the paths but leaves the groomer a single point of failure. Stream
+clocking is the other answer: run a pacer per leg and let the stream, rather than
+a shared process, be what they agree on.
+
+```bash
+moq ... export ts | moq_egress 239.0.0.1:5000 10000000 --rtp --stream-clock
+```
+
+It follows from the same property that a leg can be started, stopped and started
+again independently: a pacer that joins a stream already in flight lands on the
+grid its partner is using, and one that mutes through an outage returns on its
+partner's numbering rather than however far behind its own send count left it.
+The datagram the leg arrives in is partial; every one after it is identical.
+
+Requires an explicit constant bitrate (an auto rate is measured from one
+process's arrival window, so two legs would lock different grids) and
+`PcrMode::Regenerate` (the emitted PCR *is* the slot position, exact by
+construction rather than anchored on whichever PCR arrived first). The source
+must carry PCR; without it there is no grid. `Config::validate()` rejects the
+rest rather than letting them produce output that merges badly.
+
+A packet that arrives after its slot has gone is dropped and counted in
+`late_drops`, never re-placed: moving it would make its position depend on how
+late it was, reintroducing exactly the per-process variation the mode removes. A
+climbing count means the release latency is short for the path's jitter -- and
+the partner leg, which got the packet in time, covers for it.
+
 ## Sources and sinks
 
 Built-in `Source`s:
@@ -232,7 +278,8 @@ receiver, an ST 2022-7 pair, an FEC path) without touching the engine.
 `pace` returns, and `TsPacer::close` yields, a `Stats` snapshot:
 
 `output_packets`, `content_packets`, `null_packets`, `dropped_packets` (buffer at
-`max_latency`), `input_nulls_stripped` (source padding replaced by our own),
+`max_latency`), `late_drops` (packets that missed their slot under
+`Clocking::Stream`), `input_nulls_stripped` (source padding replaced by our own),
 `underruns` (buffer starved while the input was still live), `pcr_rebases` (source
 discontinuities), `pcr_inserted` (byte-locked PCR-only packets added to hold the
 repetition limit), `stalls` (times the input went away), `muted_packets` (output
@@ -352,6 +399,8 @@ TSDuck (`tsp`, `tsanalyze`) and, for the generated-clip mode, `ffmpeg` must be o
 
 ## Roadmap
 
-The `Source` / `Sink` split keeps the door open for ST 2022-7 seamless
-redundancy, FEC, SRT/RIST output adapters, SCTE-35 splice monitoring, and NOC
-telemetry, none of which the core pacer needs to know about.
+Stream clocking is validated by construction and in unit tests; the receiver-side
+proof -- two legs merged by a hardware or software ST 2022-7 receiver over
+impaired paths -- is being measured separately. Beyond it, the `Source` / `Sink`
+split keeps the door open for FEC, SRT/RIST output adapters, SCTE-35 splice
+monitoring, and NOC telemetry, none of which the core pacer needs to know about.
