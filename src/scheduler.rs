@@ -354,6 +354,11 @@ pub struct Scheduler {
 	/// Slot placement, present under [`Clocking::Stream`] only — its presence is
 	/// what selects the mode everywhere below.
 	grid: Option<StreamGrid>,
+	/// Release latency and its hard upper bound, in output packets: the depth the
+	/// leg aims to hold, and the depth past which it is behind the stream rather
+	/// than buffering it.
+	latency_packets: u64,
+	max_latency_packets: u64,
 	/// Added to the slot-derived RTP sequence number.
 	sequence_seed: u16,
 	/// Input-silence grace period before the source counts as stalled.
@@ -400,6 +405,8 @@ impl Scheduler {
 			anchor_slot: 0,
 			slot: 0,
 			grid: (config.clocking == Clocking::Stream).then(|| StreamGrid::new(bitrate, capacity)),
+			latency_packets: latency_to_packets(config.latency, bitrate) as u64,
+			max_latency_packets: capacity as u64,
 			sequence_seed: config.sequence_seed,
 			stall_timeout: config.stall_timeout,
 			last_content_at: None,
@@ -638,6 +645,7 @@ impl Scheduler {
 	/// `now`, advancing the byte clock. Returns a borrow of the internal scratch
 	/// buffer, valid until the next call. Never allocates after construction.
 	pub fn emit_datagram(&mut self, now: Instant) -> &[u8] {
+		self.catch_up(now);
 		self.scratch.clear();
 		let due = self.media.due(now);
 		// With no content arriving there is no clock to hold: inserting PCR into a
@@ -696,6 +704,40 @@ impl Scheduler {
 			self.stats.output_packets = self.stats.output_packets.saturating_add(1);
 		}
 		&self.scratch
+	}
+
+	/// Move the output clock to the live edge when the leg is holding more stream
+	/// than its buffer is allowed to be deep.
+	///
+	/// A leg that subscribes to a running broadcast is served from where the
+	/// relay's buffer starts, not from the live edge, and takes delivery of the
+	/// backlog at whatever rate the path gives it. Emitting at the mux rate it
+	/// cannot catch up, so without this it runs a buffer's depth behind its
+	/// partner indefinitely — the depth being an operator's tuning choice, which
+	/// is no basis for the phase of a redundant pair. The alternative already in
+	/// the code is worse: dropping the oldest packets to stay under the bound
+	/// keeps the leg late *and* deletes programme to do it.
+	///
+	/// Backlog beyond the release latency is programme the partner has already
+	/// delivered, so it is discarded by [`StreamGrid::take`] as the clock passes
+	/// it. Under arrival clocking there is no grid and nothing to skip to.
+	fn catch_up(&mut self, now: Instant) {
+		let Some(edge) = self.grid.as_ref().and_then(StreamGrid::last_slot) else {
+			return;
+		};
+		if edge.saturating_sub(self.slot) <= self.max_latency_packets {
+			return;
+		}
+		let per_datagram = self.packets_per_datagram as u64;
+		let target = edge.saturating_sub(self.latency_packets);
+		let target = target - (target % per_datagram);
+		if target <= self.slot {
+			return;
+		}
+		self.anchor = Some(now);
+		self.anchor_slot = target;
+		self.slot = target;
+		self.stats.resyncs = self.stats.resyncs.saturating_add(1);
 	}
 
 	/// The content packet for output slot `index`, if one belongs there.
@@ -1401,6 +1443,42 @@ mod tests {
 				.unwrap_or_else(|| panic!("slot {slot} is not on the partner's grid"));
 			assert_eq!(&datagram, theirs, "slot {slot} differs");
 		}
+	}
+
+	#[test]
+	fn a_backlog_delivered_after_the_clock_starts_moves_it_to_the_live_edge() {
+		// The shape a relay actually serves a new subscriber: a little content,
+		// then the rest of its buffer once the subscription is going. Choosing the
+		// phase at the first packet is not enough — by the time the backlog lands
+		// the leg is already running, and it would stay a buffer's depth behind
+		// its partner for the rest of the run.
+		let cfg = stream_config()
+			.with_latency(Duration::from_millis(50))
+			.with_max_latency(Duration::from_millis(500));
+		let mut sched = Scheduler::new(&cfg);
+		let stream = stream_packets(1_000);
+		let t0 = Instant::now();
+		for (packet, at) in &stream[..10 * RUN_LEN] {
+			sched.enqueue(packet.clone(), t0 + *at);
+		}
+		let now = t0 + Duration::from_millis(50);
+		sched.emit_datagram(now);
+		let before = sched.framing().expect("stream clocking").slot;
+
+		for (packet, _) in &stream[10 * RUN_LEN..] {
+			sched.enqueue(packet.clone(), now);
+		}
+		sched.emit_datagram(now);
+		let after = sched.framing().expect("stream clocking").slot;
+
+		assert_eq!(sched.stats().resyncs, 1, "the leg did not move to the edge");
+		let edge = 999 * RUN_SLOTS;
+		assert!(
+			after > edge - 1_000 && after > before + 30_000,
+			"slot went {before} -> {after}, with the stream's edge at {edge}"
+		);
+		// And it is at the edge to carry it, not to sit in front of it.
+		assert!(sched.has_pending(), "nothing left to send at the edge");
 	}
 
 	#[test]

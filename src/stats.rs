@@ -55,6 +55,15 @@ pub struct Stats {
 	/// diverged: both legs drop by slot, so a leg that receives the packet in time
 	/// simply covers for one that did not.
 	pub late_drops: u64,
+	/// Times the output clock was moved to the live edge under
+	/// [`Clocking::Stream`](crate::Clocking) because the leg was holding more
+	/// stream than `max_latency`.
+	///
+	/// One at start-up is a leg joining a broadcast already in progress and
+	/// taking delivery of the relay's backlog. A count that keeps climbing means
+	/// the path is delivering faster than the mux rate for long enough to build
+	/// a buffer, i.e. the configured rate is below the content rate.
+	pub resyncs: u64,
 }
 
 impl Stats {
