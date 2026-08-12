@@ -107,14 +107,20 @@ impl MediaClock {
 	}
 }
 
-/// Places packets on the absolute output grid from their source PCR alone.
+/// Places packets on the absolute output grid from the stream alone.
 ///
 /// Packets are accumulated into *runs* — a PCR-bearing packet and everything up
 /// to the next one — because a run's length is only known once the closing PCR
 /// arrives. The run is then spread evenly between the two slots its PCRs imply,
-/// so where a packet lands is a function of the delivered bytes and nothing else.
-/// The cost is one PCR interval of look-ahead (~20 ms on a typical mux) inside
-/// the release latency the pacer already holds.
+/// or from the first free slot if the previous run overran, so where a packet
+/// lands is a function of the delivered bytes and nothing else. The cost is one
+/// PCR interval of look-ahead (~20 ms on a typical mux) inside the release
+/// latency the pacer already holds.
+///
+/// Content that turns up after its slot has been transmitted is dropped rather
+/// than carried forward, so a leg returning from an outage with a backlog behind
+/// it rejoins at the current position instead of replaying what its partner has
+/// already delivered.
 #[derive(Debug)]
 struct StreamGrid {
 	map: SlotMap,
@@ -264,9 +270,15 @@ impl StreamGrid {
 		self.placed.front().map(|(slot, _)| *slot)
 	}
 
-	/// Whether any content is in hand, placed or still accumulating.
+	/// Whether any content is placed and still to be transmitted.
+	///
+	/// The run still accumulating does not count. It cannot be placed until its
+	/// closing PCR arrives, and if the source has died that PCR is never coming —
+	/// counting it would leave the pacer believing it had programme in hand for
+	/// as long as it was left running, which is the exact failure stall detection
+	/// exists to prevent.
 	fn has_content(&self) -> bool {
-		!self.placed.is_empty() || !self.run.is_empty()
+		!self.placed.is_empty()
 	}
 }
 
@@ -1186,6 +1198,34 @@ mod tests {
 		let smooth = run_leg(&cfg, &arrivals, t0, &PUNCTUAL, 2_000);
 		let rough = run_leg(&cfg, &arrivals, t0, &JITTERY, 2_000);
 		assert_ne!(by_slot(&smooth), by_slot(&rough));
+	}
+
+	#[test]
+	fn a_stream_clocked_leg_still_notices_its_source_die() {
+		// A run is held until its closing PCR arrives. If the source dies mid-run
+		// that PCR never comes, and treating the held packets as programme in hand
+		// would keep the leg reporting Live over a dead feed for as long as it ran
+		// — the failure stall detection exists to prevent, reintroduced by the
+		// mode that is supposed to make a leg's death visible to its partner.
+		let cfg = stream_config().with_stall_timeout(Some(Duration::from_millis(200)));
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		// Two full runs, then the first half of a third: content with no closing PCR.
+		for (packet, at) in stream_packets(3).into_iter().take(2 * RUN_LEN + 4) {
+			sched.enqueue(packet, t0 + at);
+		}
+		// Long past the stall timeout, but with placed content still to transmit:
+		// buffered media is programme going to air, however old the silence.
+		let now = t0 + Duration::from_secs(1);
+		assert_eq!(sched.state(now), SourceState::Live);
+
+		// Once it has all gone out, what is left is a run whose closing PCR will
+		// never arrive. That is not programme in hand.
+		for _ in 0..4 * RUN_SLOTS {
+			sched.emit_datagram(now);
+		}
+		assert_eq!(sched.state(now), SourceState::Stalled);
+		assert_eq!(sched.stats().stalls, 1);
 	}
 
 	#[test]
