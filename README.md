@@ -303,14 +303,14 @@ The simplest form pipes the paced stream straight on, just like the subscriber:
 ```bash
 # Before: subscriber straight to a soft player.
 ./moq --client-tls-disable-verify \
-      --client-connect https://34.246.187.61:443/anon \
+      --client-connect https://<relay-host>:443/anon \
       --broadcast cnn.international.emea.loop.hang \
       export ts --latency-max 5s \
   | ffplay -probesize 10M -analyzeduration 5M -vf bwdif -sync video -framedrop -i -
 
 # After: subscriber -> mpegts-pacer -> ffplay, auto-rate, over a stdout pipe.
 ./moq --client-tls-disable-verify \
-      --client-connect https://34.246.187.61:443/anon \
+      --client-connect https://<relay-host>:443/anon \
       --broadcast cnn.international.emea.loop.hang \
       export ts --latency-max 5s \
   | cargo run --release -p mpegts-pacer --example moq_egress -- - auto \
@@ -399,8 +399,13 @@ TSDuck (`tsp`, `tsanalyze`) and, for the generated-clip mode, `ffmpeg` must be o
 
 ## Roadmap
 
-Stream clocking is validated by construction and in unit tests; the receiver-side
-proof -- two legs merged by a hardware or software ST 2022-7 receiver over
-impaired paths -- is being measured separately. Beyond it, the `Source` / `Sink`
-split keeps the door open for FEC, SRT/RIST output adapters, SCTE-35 splice
-monitoring, and NOC telemetry, none of which the core pacer needs to know about.
+Stream clocking now has its receiver-side proof against a software ST 2022-7
+receiver: two pacers on independent MoQ chains, sharing no process, clock or
+messages, emit byte-identical datagrams under identical RTP sequence numbers, and
+the merged output loses nothing across leg blackout, 1 % and 3 % path loss, 50 ms
+differential delay, and the death of either chain's publisher, relay or
+subscriber. The remaining proof is a hardware IRD's own merge engine.
+
+Beyond it, the `Source` / `Sink` split keeps the door open for FEC, SRT/RIST
+output adapters, SCTE-35 splice monitoring, and NOC telemetry, none of which the
+core pacer needs to know about.
