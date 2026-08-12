@@ -128,6 +128,10 @@ struct StreamGrid {
 	run: Vec<Packet>,
 	/// `(source PCR, absolute slot)` of the packet that opened the run.
 	open: Option<(u64, u64)>,
+	/// When the open run's PCR arrived. Compared against the next PCR's advance
+	/// to tell a source discontinuity from a spell of silence; see
+	/// [`StreamGrid::slot_for`].
+	open_at: Option<Instant>,
 	/// Placed packets in slot order, awaiting their slot.
 	placed: VecDeque<(u64, Packet)>,
 	/// Added to every computed slot to keep the grid monotonic across a 33-bit
@@ -150,6 +154,7 @@ impl StreamGrid {
 			map: SlotMap::new(mux_rate_bps),
 			run: Vec::new(),
 			open: None,
+			open_at: None,
 			placed: VecDeque::new(),
 			epoch: 0,
 			last_span: None,
@@ -158,31 +163,52 @@ impl StreamGrid {
 		}
 	}
 
-	/// Absolute slot for a source PCR, keeping the grid monotonic.
-	fn slot_for(&mut self, pcr: u64) -> u64 {
+	/// Absolute slot for a source PCR seen after `since` of wall time, keeping the
+	/// grid monotonic.
+	///
+	/// A large forward PCR jump is ambiguous on its own: the source clock may have
+	/// moved (a splice or a loop wrap), or it may have carried on while this leg
+	/// missed the middle of the stream. Elapsed time tells the two apart. A jump
+	/// that matches the silence is a *gap* — the source is still on the clock the
+	/// grid was built from, so the returning content belongs in the slots its PCR
+	/// says and needs no adjustment, which is how a leg that was cut off for
+	/// twenty seconds comes back into its partner's numbering.
+	///
+	/// Returns the slot and whether it sits beyond the open run because the
+	/// source went quiet, which the caller must not spread that run across.
+	fn slot_for(&mut self, pcr: u64, since: Duration) -> (u64, bool) {
 		let raw = self.map.slot_of_pcr(pcr);
+		let mut after_silence = false;
 		if let Some((open_pcr, open_slot)) = self.open {
 			let delta = pcr::forward_delta(open_pcr, pcr);
-			let spliced = delta == 0 || pcr::ticks_to_duration(delta) > pcr::PCR_DISCONTINUITY_GAP;
-			if spliced {
-				// A loop wrap or splice moves the source clock arbitrarily. Continue
-				// the grid from where the open run ends: both legs of a pair compute
-				// the same continuation, so an aligned pair stays aligned — but a leg
-				// that joins *after* a splice cannot know it happened, which is the
-				// documented limit of stream clocking.
+			let advanced = pcr::ticks_to_duration(delta);
+			let jumped = delta == 0 || advanced > pcr::PCR_DISCONTINUITY_GAP;
+			// Content cannot arrive from the future: if we have been silent for
+			// roughly as long as the stream advanced, we simply missed the middle.
+			// The factor is loose because delivery is bursty and the returning
+			// packet may sit in a relay buffer before it reaches us.
+			let explained_by_silence = delta > 0 && advanced <= since.saturating_mul(2);
+			if jumped && !explained_by_silence {
+				// The source clock moved. Continue the grid from where the open run
+				// ends: both legs of a pair compute the same continuation, so an
+				// aligned pair stays aligned — but a leg that joins *after* a splice
+				// cannot know it happened, which is a documented limit of stream
+				// clocking.
 				let resume_at = open_slot.saturating_add(self.run.len().max(1) as u64);
 				self.epoch = i128::from(resume_at) - i128::from(raw);
 			} else if i128::from(raw) + self.epoch < i128::from(open_slot) {
 				// The 33-bit PCR value wrapped; the stream did not.
 				self.epoch += i128::from(self.map.slots_per_wrap());
+			} else {
+				after_silence = jumped;
 			}
 		}
-		(i128::from(raw) + self.epoch).max(0) as u64
+		((i128::from(raw) + self.epoch).max(0) as u64, after_silence)
 	}
 
 	/// Accept one input packet. Returns the number of packets dropped for want of
 	/// room, so the caller can count them.
-	fn push(&mut self, packet: Packet) -> u64 {
+	fn push(&mut self, packet: Packet, now: Instant) -> u64 {
 		let Some(pcr) = packet.pcr() else {
 			// Before the first PCR there is no grid to place against. Buffering
 			// these would only let them land in slots chosen by arrival order.
@@ -193,9 +219,20 @@ impl StreamGrid {
 			return 0;
 		};
 
-		let slot = self.slot_for(pcr);
-		let dropped = self.close_run(slot);
+		let since = self
+			.open_at
+			.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+		let (slot, after_silence) = self.slot_for(pcr, since);
+		// Content from before the silence belongs where it was going, not smeared
+		// across the gap: spreading it would drop fresh packets into slots the
+		// partner leg is filling with the programme that ran while we were away.
+		let dropped = if after_silence {
+			self.flush()
+		} else {
+			self.close_run(slot)
+		};
 		self.open = Some((pcr, slot));
+		self.open_at = Some(now);
 		self.run.clear();
 		self.run.push(packet);
 		dropped
@@ -268,6 +305,11 @@ impl StreamGrid {
 	/// The slot of the earliest packet awaiting emission.
 	fn first_slot(&self) -> Option<u64> {
 		self.placed.front().map(|(slot, _)| *slot)
+	}
+
+	/// The newest placed slot: the live edge of what this leg is holding.
+	fn last_slot(&self) -> Option<u64> {
+		self.placed.back().map(|(slot, _)| *slot)
 	}
 
 	/// Whether any content is placed and still to be transmitted.
@@ -389,10 +431,19 @@ impl Scheduler {
 		}
 
 		if let Some(grid) = self.grid.as_mut() {
-			let dropped = grid.push(packet);
+			let dropped = grid.push(packet, now);
 			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(dropped);
-			// The clock can only start once something has been placed: the grid
-			// position of the first packet is what the wall clock is anchored to.
+			// The clock can only start once something has been placed: where the
+			// grid starts is what the wall clock is anchored to.
+			//
+			// A leg joining a running broadcast is handed whatever the relay has
+			// buffered, oldest first. Starting on that first packet would fix its
+			// output a backlog's worth behind its partner for the rest of the
+			// run — it emits at the mux rate, so it can never catch up. It starts
+			// at the live edge of what it holds instead, one release latency back,
+			// and lets the rest age out: content whose slot has passed is content
+			// the partner has already delivered. The choice is revisited until the
+			// first datagram goes out, because the burst is still arriving.
 			//
 			// Datagram boundaries have to come off the grid as well. A leg whose
 			// first content lands mid-datagram would otherwise split every
@@ -400,12 +451,14 @@ impl Scheduler {
 			// bytes, packed differently, which merges no better than different
 			// bytes do. Rounding down to a boundary costs a few slots of leading
 			// stuffing and makes the packing a property of the stream.
-			if self.anchor.is_none()
-				&& let Some(first) = grid.first_slot()
+			if self.stats.output_packets == 0
+				&& let (Some(first), Some(edge)) = (grid.first_slot(), grid.last_slot())
 			{
 				let per_datagram = self.packets_per_datagram as u64;
-				self.anchor = Some(now + self.latency);
-				self.anchor_slot = first - (first % per_datagram);
+				let behind = latency_to_packets(self.latency, self.mux_rate_bps) as u64;
+				let start = edge.saturating_sub(behind).max(first);
+				self.anchor = Some(self.anchor.unwrap_or(now + self.latency));
+				self.anchor_slot = start - (start % per_datagram);
 				self.slot = self.anchor_slot;
 			}
 			return;
@@ -1308,6 +1361,96 @@ mod tests {
 			assert_eq!(framing.timestamp_90khz, *timestamp, "RTP timestamp diverged");
 			assert_eq!(datagram, theirs, "slot {} differs after the outage", framing.slot);
 		}
+	}
+
+	#[test]
+	fn a_leg_joining_a_running_broadcast_starts_at_the_live_edge() {
+		// A relay hands a new subscriber what it has buffered, oldest first. A leg
+		// that started on that first packet would sit a backlog behind its partner
+		// for the rest of the run: it emits at the mux rate, so it has no way to
+		// close the gap. What the pair needs is the phase a leg reaches when it
+		// starts from empty on a live feed, whatever the relay had in hand.
+		let cfg = stream_config();
+		let whole = stream_packets(1_000);
+		// Three seconds of programme delivered in one go, then delivery at rate.
+		let join_at = pcr::ticks_to_duration(600 * RUN_SLOTS * TICKS_PER_PACKET);
+		let backlogged: Vec<_> = whole
+			.iter()
+			.map(|(packet, at)| (packet.clone(), (*at).max(join_at)))
+			.collect();
+
+		let t0 = Instant::now();
+		let partner = run_leg(&cfg, &whole, t0, &PUNCTUAL, 40_000);
+		let joiner = run_leg(&cfg, &backlogged, t0, &JITTERY, 40_000);
+
+		let first = joiner.first().expect("the joining leg emitted nothing").0.slot;
+		let edge = 600 * RUN_SLOTS;
+		assert!(
+			first > edge - 1_000,
+			"the leg started {} slots behind the edge: it took the backlog as its phase",
+			edge.saturating_sub(first)
+		);
+
+		// Having skipped the backlog, it must still be on the same grid.
+		let partner: std::collections::HashMap<_, _> = by_slot(&partner).into_iter().collect();
+		let overlap = by_slot(&joiner[1..]);
+		assert!(overlap.len() > 1_000, "too little overlap to conclude anything");
+		for (slot, datagram) in overlap {
+			let theirs = partner
+				.get(&slot)
+				.unwrap_or_else(|| panic!("slot {slot} is not on the partner's grid"));
+			assert_eq!(&datagram, theirs, "slot {slot} differs");
+		}
+	}
+
+	#[test]
+	fn an_outage_longer_than_a_splice_is_still_an_outage() {
+		// A leg off the air for longer than a source discontinuity is allowed to
+		// look like has to come back onto the grid, not re-anchor itself as though
+		// the programme had been spliced. Getting this wrong is silent: the leg
+		// resumes, its numbering is right, and every packet it carries is placed in
+		// the past and dropped, so it protects nothing.
+		let cfg = stream_config().with_stall_timeout(Some(Duration::from_millis(200)));
+		// One run is ~5 ms, so the outage here is ~6 s: comfortably past the point
+		// at which a forward PCR jump would otherwise be read as a splice.
+		let whole = stream_packets(1_600);
+		let outage = 300 * RUN_LEN..1_500 * RUN_LEN;
+		let gapped: Vec<_> = whole
+			.iter()
+			.enumerate()
+			.filter(|(i, _)| !outage.contains(i))
+			.map(|(_, p)| p.clone())
+			.collect();
+
+		let t0 = Instant::now();
+		let partner = run_leg(&cfg, &whole, t0, &PUNCTUAL, 64_000);
+		let interrupted = run_leg(&cfg, &gapped, t0, &JITTERY, 64_000);
+
+		let partner: std::collections::HashMap<_, _> = partner
+			.iter()
+			.map(|(f, dg)| (f.slot, (f.sequence, dg.clone())))
+			.collect();
+		let after: Vec<_> = interrupted.iter().filter(|(f, _)| f.slot > 1_500 * RUN_SLOTS).collect();
+		assert!(after.len() > 1_000, "the leg did not come back");
+		for (framing, datagram) in &after {
+			let (sequence, theirs) = partner
+				.get(&framing.slot)
+				.unwrap_or_else(|| panic!("slot {} is not on the partner's grid", framing.slot));
+			assert_eq!(framing.sequence, *sequence, "RTP sequence diverged across the outage");
+			assert_eq!(datagram, theirs, "slot {} differs after the outage", framing.slot);
+		}
+
+		// Numbering alone is not a return to service. The leg has to be carrying
+		// the programme again, which is what the splice reading cost it.
+		let carried = after
+			.iter()
+			.flat_map(|(_, dg)| dg.chunks_exact(TS_PACKET_SIZE))
+			.filter(|p| pid_of(p) == 0x100)
+			.count();
+		assert!(
+			carried > 500,
+			"the leg resumed carrying no programme: {carried} packets"
+		);
 	}
 
 	#[test]

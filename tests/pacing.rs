@@ -607,11 +607,15 @@ async fn continue_policy_holds_the_carrier_but_stops_claiming_a_clock() {
 
 /// Pace `input` through the real engine down a path that delivers it in bursts,
 /// and return each datagram with the RTP sequence number it went out under.
+///
+/// The bursts average out to the media rate — 200 packets of 5 Mb/s content is
+/// 60 ms of programme. A path that sustained more than that would not be a path;
+/// it would be a leg permanently behind the stream, which is a different test.
 async fn leg(config: Config, input: Vec<Packet>) -> Vec<(u16, Vec<u8>)> {
 	let sent: Numbered = Arc::new(Mutex::new(Vec::new()));
 	pace_with(
 		config,
-		BurstySource::new(input, 200, Duration::from_millis(30)),
+		BurstySource::new(input, 200, Duration::from_millis(60)),
 		FramedSink::new(sent.clone()),
 		CallbackObserver::new(|_| {}),
 	)

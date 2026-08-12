@@ -75,6 +75,18 @@
 //! PCR implies, and numbers the output from that slot, so what a leg sends is a
 //! function of the stream rather than of the leg — two of them agree without
 //! sharing a process, and one can join, leave and rejoin the pair on its own.
+//!
+//! Rejoining has two conditions the mode has to meet, both of which are about
+//! refusing to take a delivery accident as a fact about the stream. A leg that
+//! subscribes to a running broadcast is handed whatever the relay has buffered,
+//! oldest first, and starts at the live edge of it rather than at its head: a
+//! leg emitting at the mux rate cannot catch up, so starting on the backlog
+//! would fix it a buffer's depth behind its partner permanently. And a leg that
+//! has been cut off for longer than a source discontinuity is allowed to last
+//! reads the jump in its source PCR against the time it spent silent, so that
+//! missing the middle of a stream is not mistaken for the stream being spliced.
+//! Getting the second wrong is invisible: the leg comes back, its numbering is
+//! right, and every packet it carries lands in a slot that has already gone.
 
 mod config;
 mod error;
