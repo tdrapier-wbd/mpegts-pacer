@@ -230,8 +230,15 @@ protects the paths but leaves the groomer a single point of failure. Stream
 clocking is the other answer: run a pacer per leg and let the stream, rather than
 a shared process, be what they agree on.
 
+Run one per leg, sharing the pair's rate, SSRC and sequence seed:
+
 ```bash
-moq ... export ts | moq_egress 239.0.0.1:5000 10000000 --rtp --stream-clock
+# leg A
+moq ... export ts | moq_egress 239.0.0.1:5000 10000000 --rtp \
+                      --ssrc 538968071 --stream-clock --sequence-seed 0
+# leg B, on its own chain
+moq ... export ts | moq_egress 239.0.0.2:5000 10000000 --rtp \
+                      --ssrc 538968071 --stream-clock --sequence-seed 0
 ```
 
 It follows from the same property that a leg can be started, stopped and started
@@ -331,6 +338,7 @@ ffplay -i 'udp://@239.0.0.1:5000'   # or point your IRD at the group
 ```text
 moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--latency-ms N]
            [--max-latency-ms N] [--ssrc N] [--stall-ms N] [--on-stall mute|continue|fail]
+           [--stream-clock] [--sequence-seed N]
 ```
 
 - `<-|stdout|dest_ip:port>` -- `-` or `stdout` to write raw TS to a pipe, or a
@@ -340,10 +348,19 @@ moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--la
 - `--preserve` -- keep source PCR values (`PcrMode::Preserve`) instead of
   regenerating them. Use for soft players, not hardware IRDs.
 - `--latency-ms N` -- de-jitter priming latency (default 200).
+- `--max-latency-ms N` -- buffer depth (default 2000); input past it is dropped
+  oldest-first.
+- `--ssrc N` -- RTP SSRC, as a decimal 32-bit integer. Both legs of a redundant
+  pair must carry the same one.
 - `--stall-ms N` -- input-silence grace before the source counts as gone (default
   1000; `0` disables detection).
 - `--on-stall mute|continue|fail` -- what to do then (default `mute`). Transitions
   are logged to stderr either way.
+- `--stream-clock` -- place packets by stream position rather than by arrival, so
+  two legs are a mergeable pair (see [Clocking](#clocking-whose-clock-decides-what-goes-in-each-slot)).
+  Requires an explicit bitrate.
+- `--sequence-seed N` -- RTP sequence offset (default 0), identical on both legs
+  of a pair.
 
 ### ffplay and "RTP: dropping old packet received too late"
 
