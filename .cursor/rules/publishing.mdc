@@ -1,0 +1,44 @@
+---
+description: Pre-push checks and the local push process for this repo
+alwaysApply: true
+---
+
+# Before pushing
+
+**Read `PUSHING.local.md` at the repo root first.** It is gitignored and
+machine-specific, and it documents the one step that is not discoverable from the
+repository: `origin` is an HTTPS remote under a different GitHub account than the
+default one on this machine, so `git push` fails with a 403 until the active account
+is switched, and must be switched back afterwards. Switching the remote to SSH does
+not work around it.
+
+Never force-push `main` or rewrite pushed history. Never `cargo publish` without
+asking: the crate is deliberately unpublished, and publishing makes the CLI flags a
+semver surface.
+
+# What CI enforces
+
+CI runs on every push to `main` with `RUSTFLAGS: -D warnings` and
+`RUSTDOCFLAGS: -D warnings`, so anything that merely warns locally fails there:
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features
+cargo test --all-features
+cargo doc --no-deps --all-features
+```
+
+Run `cargo fmt --all` *before* committing. Formatting a file after committing it
+leaves the pushed commit failing `fmt --check` on its own, and drags the fix into an
+unrelated later commit.
+
+# Changes to pacing, timing or buffering
+
+`cargo test` drives the scheduler on a synthetic clock, so it cannot see arrival
+behaviour at all. Buffer sizing, the start gate and stall detection are functions of
+*when* packets turn up, so also run the compliance harness, which needs TSDuck
+(`tsp`) and `ffmpeg` on `PATH`:
+
+```bash
+./test/run.sh --bursty
+```
