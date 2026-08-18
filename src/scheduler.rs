@@ -482,7 +482,8 @@ impl Scheduler {
 		// the rate it is being compared with. Before the second PCR there is no
 		// rate yet and the profile has nothing to say, which is why an adaptive
 		// start also has a deadline.
-		self.profile.observe(now, self.media.estimated_rate_pps().unwrap_or(0.0));
+		self.profile
+			.observe(now, self.media.estimated_rate_pps().unwrap_or(0.0));
 		self.resize();
 
 		if let Some(grid) = self.grid.as_mut() {

@@ -14,7 +14,7 @@
 //! This protects the paths to the receiver, not the chain upstream of the groomer:
 //! one process holds both legs, so anything that stops it stops the pair. To
 //! protect the chain as well, run one pacer per leg under
-//! [`Clocking::Stream`](mpegts_pacer::Clocking) — `ts_egress --rtp
+//! [`Clocking::Stream`](mpegts_pacer::Clocking) — `mpegts-pacer --rtp
 //! --stream-clock` — where each leg's bytes and numbering are a function of the
 //! stream rather than of the process, so the two agree without sharing one.
 

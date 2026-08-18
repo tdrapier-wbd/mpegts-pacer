@@ -21,7 +21,20 @@ doctest = false
 [dependencies]
 bytes = "1"
 thiserror = "2"
-tokio = { version = "1.48", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
+# io-std and rt-multi-thread are for the binary rather than the library, which is
+# generic over AsyncRead/AsyncWrite and never names a stream: the CLI pipes stdin to
+# stdout, and it wants the read side off the thread that owns the output timer,
+# because a multi-megabyte read landing there is wire jitter.
+tokio = { version = "1.48", features = [
+	"net",
+	"time",
+	"sync",
+	"rt",
+	"rt-multi-thread",
+	"macros",
+	"io-util",
+	"io-std",
+] }
 tracing = "0.1"
 
 [dev-dependencies]

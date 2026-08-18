@@ -779,7 +779,8 @@ async fn a_segmented_source_is_groomed_without_dropping_or_muting() {
 	assert_eq!(stats.stalls, 0, "read an inter-segment gap as a dead source");
 	assert_eq!(stats.muted_packets, 0, "and muted the carrier for it");
 	assert_eq!(
-		stats.content_packets, 10 * 2 * MEDIA_PPS as u64,
+		stats.content_packets,
+		10 * 2 * MEDIA_PPS as u64,
 		"every content packet must reach the wire"
 	);
 	// The last datagram is padded out, since the stream does not end on a datagram
@@ -824,7 +825,10 @@ async fn the_old_defaults_show_why_that_needed_fixing() {
 		"a 2 s bound cannot hold a 2 s segment plus a cushion"
 	);
 	assert!(stats.stalls > 0, "a 1 s timeout fires on every inter-segment gap");
-	assert!(stats.muted_packets > 0, "and mutes the carrier for most of every period");
+	assert!(
+		stats.muted_packets > 0,
+		"and mutes the carrier for most of every period"
+	);
 }
 
 #[tokio::test(start_paused = true)]
@@ -879,7 +883,12 @@ async fn segmented_leg(config: Config, input: Vec<Packet>) -> Vec<(u16, Vec<u8>)
 	let source = BurstySource::uneven(input, 2 * MEDIA_PPS, media_time(2 * MEDIA_PPS), 4, 2);
 	tokio::time::timeout(
 		Duration::from_secs(600),
-		pace_with(config, source, FramedSink::new(sent.clone()), CallbackObserver::new(|_| {})),
+		pace_with(
+			config,
+			source,
+			FramedSink::new(sent.clone()),
+			CallbackObserver::new(|_| {}),
+		),
 	)
 	.await
 	.expect("the run must finish")
@@ -914,8 +923,15 @@ async fn a_source_that_ends_before_it_primes_is_still_paced_out() {
 	// burst it failed to absorb.
 	let input = media_stream(700, MEDIA_RATE, 7);
 	let expected = input.len() as u64;
-	let stats = groom(Config::new(MUX_RATE), BurstySource::new(input, 700, Duration::from_secs(1))).await;
-	assert_eq!(stats.content_packets, expected, "the whole short input reaches the wire");
+	let stats = groom(
+		Config::new(MUX_RATE),
+		BurstySource::new(input, 700, Duration::from_secs(1)),
+	)
+	.await;
+	assert_eq!(
+		stats.content_packets, expected,
+		"the whole short input reaches the wire"
+	);
 }
 
 #[tokio::test(start_paused = true)]

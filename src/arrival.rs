@@ -333,7 +333,10 @@ mod tests {
 	fn silence_marks_the_input_as_between_deliveries() {
 		let mut profile = ArrivalProfile::new();
 		let t0 = Instant::now();
-		assert!(profile.between_deliveries(t0), "nothing is arriving before the first packet");
+		assert!(
+			profile.between_deliveries(t0),
+			"nothing is arriving before the first packet"
+		);
 		profile.observe(t0, RATE_PPS);
 		assert!(!profile.between_deliveries(t0 + Duration::from_millis(10)));
 		assert!(profile.between_deliveries(t0 + DELIVERY_GAP));

@@ -28,8 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mpegts_pacer::{
-	CallbackSink, Config, DEFAULT_AUTO_HEADROOM, Packet, Result, Source, TS_PACKET_SIZE, estimate_content_bitrate,
-	pace,
+	CallbackSink, Config, DEFAULT_AUTO_HEADROOM, Packet, Result, Source, TS_PACKET_SIZE, estimate_content_bitrate, pace,
 };
 
 const USAGE: &str = "usage: burst_replay <in.ts> <out.ts> <bitrate_bps|auto> [--segment-ms N] \

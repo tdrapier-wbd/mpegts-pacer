@@ -29,16 +29,34 @@ monorepo, where the motivating case was grooming a MoQ subscriber's `export ts`
 output for a broadcast IRD. It carries no MoQ code, so it lives here as a
 standalone crate: reusable by any MPEG-TS transport (SRT, RIST, RTP, segmented
 HTTP, file playback), citable from a paper, and buildable without the whole
-monorepo. The `ts_egress` example shows the MoQ pipe wiring alongside the
+monorepo. The command below is documented with a MoQ pipe alongside a
 segmented-HTTP one, but only because MoQ is the source that prompted the crate,
 not because the engine depends on it.
 
-It is intentionally *not* published to crates.io yet. Depend on it by git for now:
+## Install
+
+The crate is a library with one binary front end. Install the command:
+
+```bash
+cargo install --git https://github.com/tdrapier-wbd/mpegts-pacer mpegts-pacer
+mpegts-pacer --help
+```
+
+Or build it from a checkout, which is what the lab scripts do:
+
+```bash
+cargo build --release --bin mpegts-pacer   # -> target/release/mpegts-pacer
+```
+
+To use the engine directly instead, depend on the library:
 
 ```toml
 [dependencies]
 mpegts-pacer = { git = "https://github.com/tdrapier-wbd/mpegts-pacer" }
 ```
+
+Not published to crates.io yet, so both forms name the repository. Rust 1.85 or
+later (edition 2024); no system libraries, and nothing from the `moq-*` tree.
 
 ## How it works
 
@@ -308,10 +326,10 @@ Run one per leg, sharing the pair's rate, SSRC and sequence seed:
 
 ```bash
 # leg A
-moq ... export ts | ts_egress 239.0.0.1:5000 10000000 --rtp --latency-ms 200 \
+moq ... export ts | mpegts-pacer 239.0.0.1:5000 10000000 --rtp --latency-ms 200 \
                       --ssrc 538968071 --stream-clock --sequence-seed 0
 # leg B, on its own chain
-moq ... export ts | ts_egress 239.0.0.2:5000 10000000 --rtp --latency-ms 200 \
+moq ... export ts | mpegts-pacer 239.0.0.2:5000 10000000 --rtp --latency-ms 200 \
                       --ssrc 538968071 --stream-clock --sequence-seed 0
 ```
 
@@ -383,14 +401,14 @@ settled on) and `buffer_high_water` (how much of the bound the input actually
 used). `buffer_high_water` sitting at the bound with `dropped_packets` climbing
 means the bound is too low for the pattern.
 
-## Examples
+## Command line
 
 ### Live transport -> paced stdout / UDP / RTP
 
-The `ts_egress` example is a thin egress adapter: stdin -> pacer -> stdout, UDP,
-or RTP. Whatever carried the bytes is just a producer, so the whole thing is a
-pipe. Take your working receiver command and splice the pacer in before the
-player.
+`mpegts-pacer` is a thin egress adapter over the library: stdin -> pacer ->
+stdout, UDP, or RTP. Whatever carried the bytes is just a producer, so the whole
+thing is a pipe. Take your working receiver command and splice the pacer in
+before the player.
 
 The simplest form pipes the paced stream straight on, just like the subscriber:
 
@@ -407,7 +425,7 @@ The simplest form pipes the paced stream straight on, just like the subscriber:
       --client-connect https://<relay-host>:443/anon \
       --broadcast cnn.international.emea.loop.hang \
       export ts --latency-max 5s \
-  | cargo run --release -p mpegts-pacer --example ts_egress -- - auto \
+  | mpegts-pacer - auto \
   | ffplay -probesize 10M -analyzeduration 5M -vf bwdif -sync video -framedrop -i -
 ```
 
@@ -415,7 +433,7 @@ Or push it to a multicast group for a hardware IRD:
 
 ```bash
 ./moq ... export ts --latency-max 5s \
-  | cargo run --release -p mpegts-pacer --example ts_egress -- 239.0.0.1:5000 auto
+  | mpegts-pacer 239.0.0.1:5000 auto
 
 ffplay -i 'udp://@239.0.0.1:5000'   # or point your IRD at the group
 ```
@@ -427,8 +445,8 @@ differently: it sizes its buffer from the megabyte bursts it is handed instead o
 the kilobyte ones, and says so in its closing line.
 
 ```bash
-tsp -I hls https://origin.example/live/index.m3u8 -O - \
-  | cargo run --release -p mpegts-pacer --example ts_egress -- 239.0.0.1:5000 10000000 --rtp
+tsp -I hls https://origin.example/live/index.m3u8 --live -O file - \
+  | mpegts-pacer 239.0.0.1:5000 10000000 --rtp
 ```
 
 Add `--segment-ms 2000` if the packager's segment duration is known, to skip the
@@ -437,13 +455,13 @@ couple of segment periods the pacer otherwise spends working the depth out. Rais
 seconds, since a missed publish cycle on a six-second segment is a twelve-second
 gap.
 
-`ts_egress` arguments:
+Arguments (`mpegts-pacer --help`):
 
 ```text
-ts_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
-          [--segment-ms N] [--latency-ms N] [--max-latency-ms N] [--latency-ceiling-ms N]
-          [--ssrc N] [--stall-ms N] [--stall-grace-ms N] [--on-stall mute|continue|fail]
-          [--stream-clock] [--sequence-seed N]
+mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
+             [--segment-ms N] [--latency-ms N] [--max-latency-ms N] [--latency-ceiling-ms N]
+             [--ssrc N] [--stall-ms N] [--stall-grace-ms N] [--on-stall mute|continue|fail]
+             [--stream-clock] [--sequence-seed N]
 ```
 
 - `<-|stdout|dest_ip:port>` -- `-` or `stdout` to write raw TS to a pipe, or a
@@ -490,6 +508,13 @@ ffplay -reorder_queue_size 0 -fflags nobuffer -i 'rtp://239.0.0.1:5000'
 
 RTP is still the right choice for a hardware IRD that expects it; the reorder
 buffer is specific to ffmpeg's software receiver.
+
+## Examples
+
+The command covers one live source to one destination. Everything past that is an
+example in `examples/`, driving the library directly: a deterministic file shaper,
+a burst-replay harness, and the two-destination ST 2022-7 sender (`dual_rtp`) that
+a single-destination CLI cannot express.
 
 ### Offline CBR shaping (file in, CBR file out)
 
