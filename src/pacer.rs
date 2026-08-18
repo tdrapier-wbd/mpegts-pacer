@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
-use crate::config::{Bitrate, Config, DEFAULT_AUTO_FALLBACK, StallPolicy};
+use crate::config::{Bitrate, Config, DEFAULT_AUTO_FALLBACK, Stall, StallPolicy};
 use crate::error::{Error, Result};
 use crate::estimate::estimate_content_bitrate;
 use crate::observe::{Health, Observer, SourceState};
@@ -28,6 +28,14 @@ const HEALTH_INTERVAL: Duration = Duration::from_millis(250);
 /// Bound on a wait for input when no stall timeout is configured, so the engine
 /// still wakes up to report health rather than blocking indefinitely.
 const IDLE_POLL: Duration = Duration::from_secs(1);
+/// How often the engine comes back to test the start gate before the output clock
+/// is armed.
+///
+/// The same threshold that separates one delivery from the next, since that is
+/// what the gate is waiting for: a cushion filled by a burst can then start
+/// emitting in the silence that follows it, rather than sitting on a full buffer
+/// until the next burst arrives to prove the last one finished.
+const START_POLL: Duration = crate::DELIVERY_GAP;
 
 /// Run the pacer to completion: pull packets from `source`, shape them to the
 /// constant bitrate in `config`, and write paced datagrams to `sink`.
@@ -94,17 +102,39 @@ where
 	loop {
 		let Some(due) = scheduler.next_due() else {
 			// Clock not armed yet: wait for the first packet, bounded so a source
-			// that never speaks is a reported state rather than a silent hang.
-			match recv_bounded(&mut source, wait_budget(&config)).await? {
+			// that never speaks is a reported state rather than a silent hang, and
+			// so an adaptive start gets to open in the silence after a delivery
+			// rather than having to wait for the next one to arrive.
+			match recv_bounded(&mut source, START_POLL.min(wait_budget(&config))).await? {
 				Arrival::Packet(packet) => scheduler.enqueue(packet, tokio_instant::now_std()),
-				Arrival::Eof => return Ok(scheduler.stats()),
+				Arrival::Eof => {
+					// Everything delivered is still to be paced out: a source that
+					// ended before the cushion filled has handed over all there is,
+					// so emit it rather than discarding it for being short.
+					scheduler.flush();
+					if scheduler.has_pending() {
+						scheduler.start_now(tokio_instant::now_std());
+						closing = true;
+						continue;
+					}
+					return Ok(scheduler.stats());
+				}
 				Arrival::Silent => {
 					let now = tokio_instant::now_std();
+					scheduler.poll_start(now);
 					reporter.report(&mut observer, &scheduler, scheduler.state(now), now);
-					if stalls_hard(&config) {
-						return Err(Error::SourceStalled {
-							silent_for: now.saturating_duration_since(started_at),
-						});
+					// Polling for the start gate is far more frequent than the stall
+					// timeout, so the timeout is measured rather than inferred from
+					// having waited: silence since the last content, or since the
+					// run began for a source that has never spoken at all.
+					let silent = scheduler.silent_for(now);
+					let silent = if silent.is_zero() {
+						now.saturating_duration_since(started_at)
+					} else {
+						silent
+					};
+					if stalls_hard(&config) && scheduler.stall_timeout().is_some_and(|t| silent >= t) {
+						return Err(Error::SourceStalled { silent_for: silent });
 					}
 				}
 			}
@@ -127,12 +157,17 @@ where
 				// so re-reading it after emitting would report a stall the slot's
 				// own bookkeeping has not counted yet.
 				let state = scheduler.state(now);
-				match (state, config.stall_policy) {
+				// A source that ended cleanly is not a source that died. What is
+				// still buffered is programme to be paced out, and with a cushion
+				// of several seconds the drain outlasts the stall timeout, so
+				// applying the policy here would discard the tail of the stream.
+				let stalled = state == SourceState::Stalled && !closing;
+				match (stalled, config.stall_policy) {
 					// The source is gone, not late. Hold the byte clock but put
 					// nothing on the wire, so downstream sees the carrier stop
 					// instead of a programme-free stream it will read as healthy.
-					(SourceState::Stalled, StallPolicy::Mute) => scheduler.advance_muted(now),
-					(SourceState::Stalled, StallPolicy::Fail) => {
+					(true, StallPolicy::Mute) => scheduler.advance_muted(now),
+					(true, StallPolicy::Fail) => {
 						reporter.force(&mut observer, &scheduler, now);
 						return Err(Error::SourceStalled { silent_for: scheduler.silent_for(now) });
 					}
@@ -188,13 +223,20 @@ async fn recv_bounded<Src: Source>(source: &mut Src, budget: Duration) -> Result
 }
 
 /// How long to wait on a silent source before coming back to report health.
+///
+/// A derived stall timeout depends on the cushion in force, which is the running
+/// scheduler's to know; this is the bound before one exists, so it takes the
+/// timeout the configured floor implies.
 fn wait_budget(config: &Config) -> Duration {
-	config.stall_timeout.unwrap_or(IDLE_POLL)
+	config
+		.stall
+		.timeout(config.latency.target(Duration::ZERO))
+		.unwrap_or(IDLE_POLL)
 }
 
 /// Whether a stall should end the run with [`Error::SourceStalled`].
 fn stalls_hard(config: &Config) -> bool {
-	config.stall_timeout.is_some() && config.stall_policy == StallPolicy::Fail
+	config.stall != Stall::Off && config.stall_policy == StallPolicy::Fail
 }
 
 /// Rate-limits health reporting to transitions plus a slow heartbeat.

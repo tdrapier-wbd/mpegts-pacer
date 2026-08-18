@@ -96,10 +96,25 @@ impl Sink for FramedSink {
 
 /// A source that hands over its packets in chunks, pausing between them: a path
 /// that delivers the same objects as its partner, but not at the same times.
+///
+/// The chunk is delivered without awaiting, so on a paused clock it lands at one
+/// instant — a fetch at line rate. Two shapes matter, and they differ by two
+/// orders of magnitude in both dimensions: kilobyte chunks milliseconds apart from
+/// an object transport, and megabyte chunks seconds apart from a segment-fetching
+/// one, whose gap occasionally doubles when the client misses a publish cycle.
 struct BurstySource {
 	packets: std::vec::IntoIter<Packet>,
 	chunk: usize,
 	gap: Duration,
+	/// `(every, times)`: every `every`th cycle waits `times` as long and then
+	/// delivers `times` as much, which is what a client that missed a publish
+	/// cycle does — it collects the segments it is owed. The two halves are the
+	/// same event, and modelling only the long gap misses that the burst which
+	/// ends it is the one that overflows the buffer.
+	stretch: Option<(usize, u32)>,
+	bursts: usize,
+	/// Packets the burst being waited for will carry.
+	pending: usize,
 	remaining: usize,
 	next_burst: Option<tokio::time::Instant>,
 }
@@ -110,8 +125,19 @@ impl BurstySource {
 			packets: packets.into_iter(),
 			chunk,
 			gap,
+			stretch: None,
+			bursts: 0,
+			pending: chunk,
 			remaining: chunk,
 			next_burst: None,
+		}
+	}
+
+	/// The same, with every `every`th cycle `times` as long and as large.
+	fn uneven(packets: Vec<Packet>, chunk: usize, gap: Duration, every: usize, times: u32) -> Self {
+		Self {
+			stretch: Some((every, times)),
+			..Self::new(packets, chunk, gap)
 		}
 	}
 }
@@ -119,12 +145,25 @@ impl BurstySource {
 impl mpegts_pacer::Source for BurstySource {
 	async fn recv(&mut self) -> Result<Option<Packet>> {
 		if self.remaining == 0 {
-			let deadline = *self
-				.next_burst
-				.get_or_insert_with(|| tokio::time::Instant::now() + self.gap);
+			// The pacer drops and remakes this future on every output slot, so the
+			// cycle is decided once and memoised rather than re-rolled per poll.
+			let deadline = match self.next_burst {
+				Some(deadline) => deadline,
+				None => {
+					self.bursts += 1;
+					let times = match self.stretch {
+						Some((every, times)) if self.bursts % every == 0 => times,
+						_ => 1,
+					};
+					self.pending = self.chunk * times as usize;
+					let deadline = tokio::time::Instant::now() + self.gap * times;
+					self.next_burst = Some(deadline);
+					deadline
+				}
+			};
 			tokio::time::sleep_until(deadline).await;
 			self.next_burst = None;
-			self.remaining = self.chunk;
+			self.remaining = self.pending;
 		}
 		self.remaining -= 1;
 		Ok(self.packets.next())
@@ -663,6 +702,220 @@ async fn a_stream_clocked_leg_joins_the_transport_its_partner_is_sending() {
 			None => panic!("the late leg sent sequence {sequence}, which its partner never used"),
 		}
 	}
+}
+
+// --- grooming either data plane ------------------------------------------------
+
+/// The media rate of the two shapes below, and the packets one second of it takes.
+///
+/// Set 15 % under the mux rate, which is what a groomed feed looks like (and the
+/// headroom `Config::auto` picks). The margin matters: the buffer bound is a
+/// duration at the *mux* rate, so a feed running at half the mux rate gets twice
+/// as much buffer as the figure suggests, and a comfortable ratio would hide the
+/// overflow a real segmented egress hits.
+const MEDIA_RATE: u64 = 8_500_000;
+const MEDIA_PPS: usize = (MEDIA_RATE / (TS_PACKET_SIZE as u64 * 8)) as usize;
+/// One output datagram, and so the tail of nulls a stream whose length is not a
+/// multiple of it ends on.
+const DATAGRAM: u64 = 7;
+
+/// How long `packets` of media lasts, and so the silence a rate-matched delivery
+/// of that many is followed by.
+///
+/// Both shapes below are built from this, because a delivery that is not
+/// rate-matched is not a burst pattern — it is a feed running at the wrong rate,
+/// which starves or overflows whatever the buffer does.
+fn media_time(packets: usize) -> Duration {
+	Duration::from_secs_f64(packets as f64 / MEDIA_PPS as f64)
+}
+
+/// A segmented-HTTP egress: two-second segments fetched at line rate, with every
+/// fourth cycle collecting two at once after twice the wait. This is the shape a
+/// lab capture of `tsp -I hls` has — mostly 2 s gaps, occasional 4 s ones, and a
+/// median burst larger than one segment because of them.
+fn segmented(segments: usize) -> BurstySource {
+	let per_segment = 2 * MEDIA_PPS;
+	BurstySource::uneven(
+		media_stream(segments * per_segment, MEDIA_RATE, 20),
+		per_segment,
+		media_time(per_segment),
+		4,
+		2,
+	)
+}
+
+/// An object-transport egress: ~12 kB bursts a few milliseconds apart, with an
+/// occasional silence of ~140 ms, which is the worst a lab capture of a MoQ egress
+/// showed. Two orders of magnitude off the shape above in both dimensions.
+fn objects(seconds: usize) -> BurstySource {
+	let per_burst = 66;
+	let bursts = seconds * MEDIA_PPS / per_burst;
+	BurstySource::uneven(
+		media_stream(bursts * per_burst, MEDIA_RATE, 20),
+		per_burst,
+		media_time(per_burst),
+		12,
+		12,
+	)
+}
+
+/// Pace a source to a discarding sink and return the stats.
+async fn groom(config: Config, source: BurstySource) -> mpegts_pacer::Stats {
+	let out = Arc::new(Mutex::new(Vec::new()));
+	tokio::time::timeout(Duration::from_secs(600), pace(config, source, CollectSink(out)))
+		.await
+		.expect("the run must finish rather than mute its own tail")
+		.unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_segmented_source_is_groomed_without_dropping_or_muting() {
+	// The point of the whole exercise. Fed a feed that arrives a segment at a time,
+	// with no flag saying so, the pacer must not drop programme out of it, underrun
+	// between segments, or read an ordinary inter-segment gap as a dead source.
+	let stats = groom(Config::new(MUX_RATE), segmented(10)).await;
+
+	assert_eq!(stats.dropped_packets, 0, "dropped programme from a healthy feed");
+	assert_eq!(stats.stalls, 0, "read an inter-segment gap as a dead source");
+	assert_eq!(stats.muted_packets, 0, "and muted the carrier for it");
+	assert_eq!(
+		stats.content_packets, 10 * 2 * MEDIA_PPS as u64,
+		"every content packet must reach the wire"
+	);
+	// The last datagram is padded out, since the stream does not end on a datagram
+	// boundary. Anything past that would be a real starve between segments.
+	assert!(
+		stats.underruns < DATAGRAM,
+		"starved between segments: {} underruns",
+		stats.underruns
+	);
+
+	// And it sized itself from the arrival pattern rather than from a default.
+	assert!(
+		(1_500..4_500).contains(&stats.arrival_lead_ms),
+		"expected a lead of one or two segments, got {} ms",
+		stats.arrival_lead_ms
+	);
+	assert!(
+		stats.latency_target_ms >= 4_000,
+		"a {} ms cushion cannot ride out the 4 s gap this feed has",
+		stats.latency_target_ms
+	);
+	assert!(
+		stats.burst_max_packets >= 2 * MEDIA_PPS as u64,
+		"the reported burst {} is smaller than the segment delivered",
+		stats.burst_max_packets
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_old_defaults_show_why_that_needed_fixing() {
+	// The control arm: the same feed through the depths a groomer tuned for an
+	// object transport used. All three failures are visible at once, which is why
+	// they are not one mistuned timeout.
+	let pinned = Config::new(MUX_RATE)
+		.with_latency(Duration::from_millis(200))
+		.with_max_latency(Duration::from_millis(2_000))
+		.with_stall_timeout(Some(Duration::from_secs(1)));
+	let stats = groom(pinned, segmented(10)).await;
+
+	assert!(
+		stats.dropped_packets > 0,
+		"a 2 s bound cannot hold a 2 s segment plus a cushion"
+	);
+	assert!(stats.stalls > 0, "a 1 s timeout fires on every inter-segment gap");
+	assert!(stats.muted_packets > 0, "and mutes the carrier for most of every period");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_object_source_pays_nothing_for_it() {
+	// The regression guard. Adaptive sizing is measured against the arrival pattern
+	// rather than switched on by transport, so the object plane has to come out
+	// where it always did: a cushion in the hundreds of milliseconds, not the
+	// seconds a segmented feed needs.
+	let stats = groom(Config::new(MUX_RATE), objects(20)).await;
+
+	assert!(
+		stats.latency_target_ms < 500,
+		"an object feed's cushion inflated to {} ms (lead {} ms)",
+		stats.latency_target_ms,
+		stats.arrival_lead_ms
+	);
+	assert_eq!(stats.dropped_packets, 0, "no drops");
+	assert_eq!(stats.stalls, 0, "no stalls");
+	assert_eq!(stats.muted_packets, 0, "no muting");
+	assert!(stats.underruns < DATAGRAM, "no starve past the padded final datagram");
+	// The largest burst is the catch-up delivery after the ~140 ms silence, not the
+	// typical one — and it is still a small fraction of a segment, which is the
+	// whole reason the two planes need different depths.
+	assert!(
+		stats.burst_max_packets < MEDIA_PPS as u64 / 2,
+		"expected bursts far short of a segment, got {} packets",
+		stats.burst_max_packets
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_clocked_pair_still_agrees_on_a_segmented_feed() {
+	// Stream clocking requires pinned depths precisely because an adaptive cushion
+	// is measured from one leg's own arrival window. Pinned from the segment
+	// duration, the pair property survives the burst shape: what a leg emits is a
+	// function of the stream, so two of them agree without sharing a process.
+	let input = media_stream(6 * 2 * MEDIA_PPS, MEDIA_RATE, 20);
+	let config = Config::new(MUX_RATE)
+		.with_segment_duration(Duration::from_secs(2))
+		.with_clocking(Clocking::Stream);
+	config.validate().expect("pinned depths are what stream clocking needs");
+
+	let one = segmented_leg(config, input.clone()).await;
+	let two = segmented_leg(config, input).await;
+	assert!(one.len() > 100, "the leg emitted almost nothing");
+	assert_eq!(one, two, "two legs fed the same stream must emit the same datagrams");
+}
+
+/// One stream-clocked leg of a pair, fed a segmented arrival pattern.
+async fn segmented_leg(config: Config, input: Vec<Packet>) -> Vec<(u16, Vec<u8>)> {
+	let sent: Numbered = Arc::new(Mutex::new(Vec::new()));
+	let source = BurstySource::uneven(input, 2 * MEDIA_PPS, media_time(2 * MEDIA_PPS), 4, 2);
+	tokio::time::timeout(
+		Duration::from_secs(600),
+		pace_with(config, source, FramedSink::new(sent.clone()), CallbackObserver::new(|_| {})),
+	)
+	.await
+	.expect("the run must finish")
+	.unwrap();
+	let sent = sent.lock().unwrap();
+	sent.clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_adaptive_cushion_is_refused_where_two_legs_must_agree() {
+	let config = Config::new(MUX_RATE).with_clocking(Clocking::Stream);
+	assert!(
+		config.validate().is_err(),
+		"two legs sizing their own cushions would hold different depths"
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cushion_deeper_than_the_buffer_is_refused() {
+	// A priming target the buffer cannot physically hold: the pacer would drop the
+	// input to make room for itself, for ever, and report nothing unusual.
+	let config = Config::new(MUX_RATE)
+		.with_max_latency(Duration::from_millis(500))
+		.with_latency(Duration::from_secs(2));
+	assert!(config.validate().is_err(), "latency past max_latency must be rejected");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_source_that_ends_before_it_primes_is_still_paced_out() {
+	// An adaptive start holds output back until it holds a cushion. A short input
+	// never gets there, and discarding it for being short would be worse than any
+	// burst it failed to absorb.
+	let input = media_stream(700, MEDIA_RATE, 7);
+	let expected = input.len() as u64;
+	let stats = groom(Config::new(MUX_RATE), BurstySource::new(input, 700, Duration::from_secs(1))).await;
+	assert_eq!(stats.content_packets, expected, "the whole short input reaches the wire");
 }
 
 #[tokio::test(start_paused = true)]

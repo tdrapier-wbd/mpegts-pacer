@@ -19,6 +19,30 @@ and deterministic.
 
 `[hard]` checks fail the run; `[shape]` checks warn unless `--strict`.
 
+## The bursty arm (`--bursty`)
+
+Everything above is blind to *arrival timing*, and structurally so: `cbr_file`
+drives the scheduler on a synthetic clock derived from the source PCR, which is
+what makes it deterministic and also means it has no arrival pattern at all.
+Buffer sizing, the start gate and stall detection are all functions of when
+packets turn up, so none of them are exercised.
+
+`--bursty` adds an arm that replays the same clip through the **live** pacer the
+way a segment-fetching client delivers it: a segment's worth of media at line
+rate, then silence until the next is due, with every fourth cycle waiting twice as
+long and collecting two segments (`--segment-ms` sets the period, default 2000).
+It then runs the same `pcrverify` gate and compliance report on the result, so the
+assertion is that burst-delivered input comes out to the same PCR accuracy as
+file-delivered input.
+
+`burst_replay` also fails the run itself on the three things the analyzer cannot
+see, because they are properties of the input rather than the output: packets
+dropped on arrival, stalls declared on inter-segment gaps, and content that never
+reached the wire. An analyzer looking only at the output cannot distinguish burst
+absorbed from programme deleted.
+
+This arm runs in real time, so it costs the clip's own duration.
+
 ## Running
 
 ```bash
@@ -27,6 +51,8 @@ and deterministic.
 ./run.sh --bitrate 12000000  # force the target mux rate
 ./run.sh --pcr preserve      # preserve source PCR (no byte-lock/re-insert)
 ./run.sh --strict            # also fail on broadcast-shape warnings
+./run.sh --bursty            # also run the live segment-burst arm
+./run.sh --bursty --segment-ms 6000
 ```
 
 Requires TSDuck (`tsp`, `tsanalyze`), `python3`, `cargo`, and (when generating a

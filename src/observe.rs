@@ -35,7 +35,7 @@ pub enum SourceState {
 	Starved,
 
 	/// The buffer is empty and no content has arrived for longer than
-	/// [`Config::stall_timeout`](crate::Config::stall_timeout). The source is
+	/// [`Config::stall`](crate::Config::stall). The source is
 	/// treated as gone rather than late, and
 	/// [`Config::stall_policy`](crate::Config::stall_policy) applies.
 	Stalled,

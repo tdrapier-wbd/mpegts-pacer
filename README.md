@@ -2,11 +2,16 @@
 
 Transport-agnostic MPEG-TS constant-bitrate pacer for broadcast (IRD) egress.
 
-Modern IP transports (MoQ, SRT, RIST, RTP, file playback) deliver MPEG-TS in
-bursts. Professional Integrated Receiver/Decoders (IRDs) expect a smooth,
-constant-bitrate transport with byte-accurate PCR. This crate is the missing
-adaptation layer between the two: feed it already-multiplexed transport packets
-and it emits a deterministic CBR stream a hardware IRD will accept.
+Modern IP transports (MoQ, SRT, RIST, segmented HTTP, file playback) deliver
+MPEG-TS in bursts. Professional Integrated Receiver/Decoders (IRDs) expect a
+smooth, constant-bitrate transport with byte-accurate PCR. This crate is the
+missing adaptation layer between the two: feed it already-multiplexed transport
+packets and it emits a deterministic CBR stream a hardware IRD will accept.
+
+They burst on very different scales, and by default the pacer works out which it
+is being given rather than being told: an object transport arrives in kilobyte
+bursts milliseconds apart, a segment-fetching one in megabyte bursts seconds
+apart, and the same binary grooms both. See [Buffer depth](#buffer-depth).
 
 It is **not** a muxer. It never demultiplexes, remultiplexes, rewrites PSI,
 regenerates PAT/PMT, or touches continuity counters. PID structure and PES/PSI
@@ -22,10 +27,11 @@ possible source. Point it at SRT, RIST, a file, or a socket and nothing changes.
 This crate began life inside the [moq-dev](https://github.com/moq-dev/moq)
 monorepo, where the motivating case was grooming a MoQ subscriber's `export ts`
 output for a broadcast IRD. It carries no MoQ code, so it lives here as a
-standalone crate: reusable by any MPEG-TS transport (SRT, RIST, RTP, file
-playback), citable from a paper, and buildable without the whole monorepo. The
-`moq-egress` example still shows the MoQ pipe wiring, but only because MoQ is the
-source that prompted the crate, not because the engine depends on it.
+standalone crate: reusable by any MPEG-TS transport (SRT, RIST, RTP, segmented
+HTTP, file playback), citable from a paper, and buildable without the whole
+monorepo. The `ts_egress` example shows the MoQ pipe wiring alongside the
+segmented-HTTP one, but only because MoQ is the source that prompted the crate,
+not because the engine depends on it.
 
 It is intentionally *not* published to crates.io yet. Depend on it by git for now:
 
@@ -48,7 +54,10 @@ Two clocks run side by side:
 
 Every output slot emits a content packet when the media clock says one is due and
 the buffer has it, otherwise a null packet. So a burst is absorbed by a bounded
-jitter buffer and released at media rate, while the wire stays CBR.
+jitter buffer and released at media rate, while the wire stays CBR. How much burst
+that buffer can absorb is the one thing that differs by orders of magnitude between
+transports, so by default it is derived from the arrival pattern rather than
+configured -- see [Buffer depth](#buffer-depth).
 
 A third thing is tracked alongside those clocks: whether content is still
 *arriving*. See [Content liveness](#content-liveness) -- stuffing is the right
@@ -97,13 +106,76 @@ Build a `Config` with `Config::new(bitrate)` (explicit rate) or `Config::auto()`
 | `Config::new(bitrate)` | `u64` bits/s | required | Constant output rate over full 188-byte packets (content + stuffing). Must be at least the peak instantaneous input rate. |
 | `Config::auto()` | -- | -- | Derive the rate from the source's measured content rate (see [Auto bitrate](#auto-bitrate)). |
 | `.with_bitrate(Bitrate)` | `Bitrate` | -- | Set the rate target directly (`Bitrate::Constant(bps)` or `Bitrate::Auto { headroom }`). |
-| `.with_latency(d)` | `Duration` | 200 ms | De-jitter priming: how long to fill the buffer before the first emit, and the steady-state cushion. Larger absorbs more burst at the cost of latency. |
-| `.with_max_latency(d)` | `Duration` | 2000 ms | Hard cap on buffered media. Input past this depth is dropped oldest-first to keep latency and memory bounded. |
+| `.with_latency(d)` | `Duration` | -- | **Pin** the de-jitter cushion: how long to fill the buffer before the first emit, and the steady-state depth. Turns adaptive sizing off (see [Buffer depth](#buffer-depth)). |
+| `.with_max_latency(d)` | `Duration` | -- | **Pin** the hard cap on buffered media. Input past this depth is dropped oldest-first. Also turns adaptive sizing off. |
+| `.with_adaptive_latency(floor, ceiling, factor)` | `Duration, Duration, f64` | 200 ms, 8 s, 2.5 | Size the cushion from the input's observed arrival pattern. The default. |
+| `.with_segment_duration(d)` | `Duration` | -- | Pin both depths from a known segment duration, for a segmented input whose packager you control. |
 | `.with_pcr_mode(m)` | `PcrMode` | `Regenerate` | How the PCR is handled (see [PCR modes](#pcr-modes)). |
 | `.with_packets_per_datagram(n)` | `usize` | 7 | Packets coalesced per output datagram. 7 * 188 = 1316 bytes fits a 1500-byte MTU over UDP/RTP. |
 | `.with_pcr_max_interval(d)` | `Duration` | 40 ms | Max PCR repetition to hold on the output (TR 101 290 P1 limit). Under `Regenerate`, extra byte-locked PCR-only packets are inserted into stuffing slots when the source PCR is sparser than this. Ignored under `Preserve`. |
-| `.with_stall_timeout(o)` | `Option<Duration>` | 1000 ms | How long the input may carry no content before it counts as gone rather than late. Grace *on top of* `latency`. `None` disables detection (carrier forever). |
+| `.with_stall_timeout(o)` | `Option<Duration>` | -- | **Pin** how long the input may carry no content before it counts as gone rather than late. `None` disables detection (carrier forever). |
+| `.with_stall_grace(d)` | `Duration` | 1000 ms | Derive the stall timeout as the cushion in force plus this. The default. |
 | `.with_stall_policy(p)` | `StallPolicy` | `Mute` | What to do once stalled (see [Content liveness](#content-liveness)). |
+
+### Buffer depth
+
+The cushion is the difference between a groomer that serves one data plane and
+one that serves any of them, so by default it is measured rather than configured.
+
+Burst granularity differs by two orders of magnitude between transports. A MoQ
+egress arrives in ~12 kB bursts whose worst silence is around 150 ms; a
+segmented-HTTP egress carrying the same programme arrives in ~2.4 MB bursts with
+silences of two to four seconds. Set for the first and fed the second, a pacer
+fails three separate ways at once: the buffer is smaller than one burst, so it
+drops programme out of a perfectly healthy feed on every segment; output starts on
+a timer holding 200 ms of media with the next burst two seconds away, so it
+underruns immediately; and a one-second stall timeout fires on every ordinary
+inter-segment gap, muting the carrier for most of every period.
+
+What the pacer measures is the **lead**: how much media the input has handed over
+ahead of real time. That is exactly the occupancy the arrival pattern forces, and
+it separates the two cases cleanly without anything having to name them — a feed
+delivered at the media rate never gets ahead, whatever its burst size and however
+long it runs, while a segment fetched at line rate gets a whole segment ahead.
+Three things follow from it:
+
+- the cushion is `lead * factor`, clamped to `[floor, ceiling]`. `factor`
+  covers a normal gap becoming the worst one: a client that misses a publish cycle
+  waits two segment periods rather than one.
+- the hard cap is twice the cushion, floored at the 2000 ms a pinned configuration
+  defaults to, so a burst landing on a full cushion is absorbed rather than
+  dropped.
+- the stall timeout is the cushion plus `stall_grace`. Buffered media is still
+  programme going to air, so silence only counts against a source once the
+  cushion it was covering is spent.
+
+Output also starts on content rather than on a timer here, and waits for a
+delivery to *finish* before committing: a segmented feed reaches a 200 ms cushion
+a few milliseconds into a two-second segment fetch, and a pacer that started there
+would drain what it held and then read the ordinary gap as an underrun. A
+continuous feed is never mid-delivery in that sense, so it starts as soon as it is
+primed, exactly as it did before any of this existed. `ceiling` bounds the wait for
+the input that fits neither description.
+
+On a MoQ feed the whole mechanism is a no-op: the lead stays near zero, so the
+cushion sits on the 200 ms floor and the run is indistinguishable from a pinned
+one. The costs are on the segmented side, and are inherent rather than
+implementation artefacts:
+
+- **Startup latency** is a couple of segment periods, because the depth cannot be
+  known until a delivery has been seen. `with_segment_duration(d)` skips it when
+  the packager's segment duration is known.
+- **Detection time** is a segment period rather than a second. On a segmented plane
+  a dead origin and a slow publish are indistinguishable faster than that, so the
+  off-the-shelf reassembly is paid for in how long a real failure takes to surface.
+- **Memory**: the 8 s ceiling is about 10 MB resident at 10 Mb/s.
+
+Pinning any depth turns the whole mechanism off — an operator who has said how
+deep the buffer should be has said it. `Clocking::Stream` requires pinned depths
+for the same reason it requires an explicit bitrate: two legs measuring their own
+arrival windows would hold different cushions and start on different slots,
+spending skew budget a receiver needs. `Config::validate()` rejects the
+combination rather than letting it produce output that merges badly.
 
 ### PCR modes
 
@@ -167,7 +239,9 @@ any silence to detect. Grooming decouples *carrier* liveness from *content*
 liveness, and only the pacer is positioned to tell them apart.
 
 So the engine tracks when content last **arrived**, not just what it emitted, and
-past `stall_timeout` it treats the source as gone:
+past the stall timeout (by default the cushion in force plus one second, so it
+scales with the arrival pattern rather than needing to be re-tuned per plane) it
+treats the source as gone:
 
 - It stops inserting its own PCR. Re-insertion exists to hold the repetition limit
   for a stream being carried; there is no clock to hold in a stream with no
@@ -234,10 +308,10 @@ Run one per leg, sharing the pair's rate, SSRC and sequence seed:
 
 ```bash
 # leg A
-moq ... export ts | moq_egress 239.0.0.1:5000 10000000 --rtp \
+moq ... export ts | ts_egress 239.0.0.1:5000 10000000 --rtp --latency-ms 200 \
                       --ssrc 538968071 --stream-clock --sequence-seed 0
 # leg B, on its own chain
-moq ... export ts | moq_egress 239.0.0.2:5000 10000000 --rtp \
+moq ... export ts | ts_egress 239.0.0.2:5000 10000000 --rtp --latency-ms 200 \
                       --ssrc 538968071 --stream-clock --sequence-seed 0
 ```
 
@@ -248,11 +322,13 @@ partner's numbering rather than however far behind its own send count left it.
 The datagram the leg arrives in is partial; every one after it is identical.
 
 Requires an explicit constant bitrate (an auto rate is measured from one
-process's arrival window, so two legs would lock different grids) and
-`PcrMode::Regenerate` (the emitted PCR *is* the slot position, exact by
-construction rather than anchored on whichever PCR arrived first). The source
-must carry PCR; without it there is no grid. `Config::validate()` rejects the
-rest rather than letting them produce output that merges badly.
+process's arrival window, so two legs would lock different grids), an explicit
+latency (an adaptive cushion is measured the same way, so two legs would start on
+different slots and hold different depths), and `PcrMode::Regenerate` (the emitted
+PCR *is* the slot position, exact by construction rather than anchored on whichever
+PCR arrived first). The source must carry PCR; without it there is no grid.
+`Config::validate()` rejects the rest rather than letting them produce output that
+merges badly.
 
 A packet that arrives after its slot has gone is dropped and counted in
 `late_drops`, never re-placed: moving it would make its position depend on how
@@ -297,13 +373,24 @@ silence), and `null_ratio()`.
 run that reports zero loss, zero drops and a healthy bitrate may still have spent
 most of its life carrying nothing.
 
+Four more describe the *input* rather than the output, so a run can be judged
+against the arrival pattern it was actually given: `bursts` and
+`burst_max_packets` (deliveries seen and the largest, grouping arrivals more than
+1 ms apart, which is the threshold an external cadence instrument uses, so the two
+are comparable), `arrival_lead_ms` (media handed over ahead of real time — the
+figure adaptive sizing works from), `latency_target_ms` (the cushion the pacer
+settled on) and `buffer_high_water` (how much of the bound the input actually
+used). `buffer_high_water` sitting at the bound with `dropped_packets` climbing
+means the bound is too low for the pattern.
+
 ## Examples
 
-### Live MoQ subscriber -> paced stdout / UDP / RTP
+### Live transport -> paced stdout / UDP / RTP
 
-The `moq_egress` example is a thin MoQ egress adapter: stdin -> pacer -> stdout,
-UDP, or RTP. The MoQ subscriber is just a producer, so the whole thing is a pipe.
-Take your working subscriber command and splice the pacer in before the player.
+The `ts_egress` example is a thin egress adapter: stdin -> pacer -> stdout, UDP,
+or RTP. Whatever carried the bytes is just a producer, so the whole thing is a
+pipe. Take your working receiver command and splice the pacer in before the
+player.
 
 The simplest form pipes the paced stream straight on, just like the subscriber:
 
@@ -320,7 +407,7 @@ The simplest form pipes the paced stream straight on, just like the subscriber:
       --client-connect https://<relay-host>:443/anon \
       --broadcast cnn.international.emea.loop.hang \
       export ts --latency-max 5s \
-  | cargo run --release -p mpegts-pacer --example moq_egress -- - auto \
+  | cargo run --release -p mpegts-pacer --example ts_egress -- - auto \
   | ffplay -probesize 10M -analyzeduration 5M -vf bwdif -sync video -framedrop -i -
 ```
 
@@ -328,17 +415,35 @@ Or push it to a multicast group for a hardware IRD:
 
 ```bash
 ./moq ... export ts --latency-max 5s \
-  | cargo run --release -p mpegts-pacer --example moq_egress -- 239.0.0.1:5000 auto
+  | cargo run --release -p mpegts-pacer --example ts_egress -- 239.0.0.1:5000 auto
 
 ffplay -i 'udp://@239.0.0.1:5000'   # or point your IRD at the group
 ```
 
-`moq_egress` arguments:
+### Live segmented HTTP -> paced UDP / RTP
+
+The same pipe, with the receiver swapped. Nothing in the pacer is configured
+differently: it sizes its buffer from the megabyte bursts it is handed instead of
+the kilobyte ones, and says so in its closing line.
+
+```bash
+tsp -I hls https://origin.example/live/index.m3u8 -O - \
+  | cargo run --release -p mpegts-pacer --example ts_egress -- 239.0.0.1:5000 10000000 --rtp
+```
+
+Add `--segment-ms 2000` if the packager's segment duration is known, to skip the
+couple of segment periods the pacer otherwise spends working the depth out. Raise
+`--latency-ceiling-ms` above the default 8000 for segments longer than about three
+seconds, since a missed publish cycle on a six-second segment is a twelve-second
+gap.
+
+`ts_egress` arguments:
 
 ```text
-moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--latency-ms N]
-           [--max-latency-ms N] [--ssrc N] [--stall-ms N] [--on-stall mute|continue|fail]
-           [--stream-clock] [--sequence-seed N]
+ts_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
+          [--segment-ms N] [--latency-ms N] [--max-latency-ms N] [--latency-ceiling-ms N]
+          [--ssrc N] [--stall-ms N] [--stall-grace-ms N] [--on-stall mute|continue|fail]
+          [--stream-clock] [--sequence-seed N]
 ```
 
 - `<-|stdout|dest_ip:port>` -- `-` or `stdout` to write raw TS to a pipe, or a
@@ -347,18 +452,25 @@ moq_egress <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve] [--la
 - `--rtp` -- RTP encapsulation instead of raw UDP (ignored for stdout).
 - `--preserve` -- keep source PCR values (`PcrMode::Preserve`) instead of
   regenerating them. Use for soft players, not hardware IRDs.
-- `--latency-ms N` -- de-jitter priming latency (default 200).
-- `--max-latency-ms N` -- buffer depth (default 2000); input past it is dropped
+- `--segment-ms N` -- pin the depths from a known segment duration, instead of
+  measuring them.
+- `--latency-ms N` -- pin the de-jitter cushion, turning adaptive sizing off. With
+  no depth flag at all the cushion is sized from arrival between 200 ms and 8 s
+  (see [Buffer depth](#buffer-depth)).
+- `--max-latency-ms N` -- pin the buffer depth; input past it is dropped
   oldest-first.
+- `--latency-ceiling-ms N` -- raise the ceiling on an adaptively sized cushion
+  (default 8000), for segments longer than about three seconds.
 - `--ssrc N` -- RTP SSRC, as a decimal 32-bit integer. Both legs of a redundant
   pair must carry the same one.
-- `--stall-ms N` -- input-silence grace before the source counts as gone (default
-  1000; `0` disables detection).
+- `--stall-ms N` -- pin the input-silence grace before the source counts as gone
+  (`0` disables detection). By default it is the cushion plus one second.
+- `--stall-grace-ms N` -- change that one second.
 - `--on-stall mute|continue|fail` -- what to do then (default `mute`). Transitions
   are logged to stderr either way.
 - `--stream-clock` -- place packets by stream position rather than by arrival, so
   two legs are a mergeable pair (see [Clocking](#clocking-whose-clock-decides-what-goes-in-each-slot)).
-  Requires an explicit bitrate.
+  Requires an explicit bitrate and an explicit `--latency-ms` or `--segment-ms`.
 - `--sequence-seed N` -- RTP sequence offset (default 0), identical on both legs
   of a pair.
 
@@ -398,6 +510,32 @@ tsp -I file out.ts -P pcrverify --jitter-max 500 -O drop
 cbr_file <in.ts> <out.ts> <bitrate_bps|auto> [preserve|regenerate]
 ```
 
+### Burst replay (file in, live pacer, CBR file out)
+
+`cbr_file` is deterministic because it drives the scheduler on a synthetic clock,
+which also means it has no arrival timing to test. `burst_replay` feeds the same
+file through the **live** `pace()` loop the way a segment fetcher delivers it, so
+buffer sizing, the start gate and stall detection are actually exercised. It runs
+in real time.
+
+```bash
+cargo run --release -p mpegts-pacer --example burst_replay -- in.ts out.ts auto --segment-ms 2000
+tsp -I file out.ts -P pcrverify --jitter-max 500 -O drop
+```
+
+```text
+burst_replay <in.ts> <out.ts> <bitrate_bps|auto> [--segment-ms N] [--double-every N]
+             [--segment-hint] [--latency-ms N] [--max-latency-ms N] [--stall-ms N]
+```
+
+Burst sizes come from the file's own PCR-implied media rate, so the delivery is
+rate-matched however it was encoded. `--double-every N` sets how often a cycle
+waits twice as long and then collects two segments, as a client that missed a
+publish cycle does (default 4). `--segment-hint` pins the depths from the segment
+duration instead of letting the pacer derive them, which is the control arm for
+whether it needs telling. The example exits non-zero on dropped packets, stalls, or
+content that never reached the wire.
+
 ## Compliance
 
 `test/` runs a self-contained TSDuck-based compliance harness (PCR accuracy,
@@ -409,7 +547,15 @@ something a hardware IRD accepts. Run it via:
 ./test/run.sh                     # generate a clip, pace it, analyze
 ./test/run.sh --source cap.ts     # pace a real capture instead
 ./test/run.sh --strict            # also fail on broadcast-shape warnings
+./test/run.sh --bursty            # also replay it through the live pacer in segment bursts
 ```
+
+The `--bursty` arm exists because the rest of the harness structurally cannot test
+burst absorption: `cbr_file` drives the scheduler on a synthetic clock with no
+arrival timing, and buffer sizing, the start gate and stall detection are all
+functions of when packets turn up. It replays the same clip through the live pacer
+the way a segment fetcher delivers it and puts the result through the same
+`pcrverify` gate.
 
 TSDuck (`tsp`, `tsanalyze`) and, for the generated-clip mode, `ffmpeg` must be on
 `PATH`. See [`test/README.md`](test/README.md) for details.

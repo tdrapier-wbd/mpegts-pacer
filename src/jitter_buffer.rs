@@ -27,6 +27,17 @@ impl JitterBuffer {
 		}
 	}
 
+	/// Raise the capacity to `capacity`, never lowering it.
+	///
+	/// The bound is sized from the arrival pattern, which is only learned as the
+	/// input arrives, so it moves upward as evidence accumulates. It does not move
+	/// back down: the depth the pacer *aims* to hold can fall again when a burst
+	/// ages out of the measurement, but shrinking the bound underneath media
+	/// already accepted would drop programme to satisfy a revised estimate.
+	pub fn grow_to(&mut self, capacity: usize) {
+		self.capacity = self.capacity.max(capacity.max(1));
+	}
+
 	/// Push a packet. Returns `true` if the buffer was full and the oldest packet
 	/// was dropped to make room (the caller bumps the drop stat).
 	pub fn push(&mut self, packet: Packet) -> bool {
@@ -78,6 +89,20 @@ mod tests {
 		assert_eq!(buf.pop().unwrap().as_bytes()[4], 1);
 		assert_eq!(buf.pop().unwrap().as_bytes()[4], 2);
 		assert!(buf.is_empty());
+	}
+
+	#[test]
+	fn capacity_only_grows() {
+		let mut buf = JitterBuffer::new(2);
+		buf.grow_to(4);
+		for i in 0..3 {
+			assert!(!buf.push(packet(i)), "packet {i} fits the raised capacity");
+		}
+		// A revised-down estimate must not evict media already accepted.
+		buf.grow_to(1);
+		assert!(!buf.push(packet(3)), "the bound stayed at 4");
+		assert_eq!(buf.len(), 4);
+		assert!(buf.push(packet(4)), "and 4 is still the bound");
 	}
 
 	#[test]

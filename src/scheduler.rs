@@ -18,6 +18,15 @@
 //! and the buffer has it, otherwise a null packet. So a burst is absorbed by the
 //! [`JitterBuffer`] and released at media rate, while the wire stays CBR.
 //!
+//! How much burst it can absorb is the one thing that differs by two orders of
+//! magnitude between data planes, so under [`Latency::Adaptive`] the depths are
+//! not configured but measured: an [`ArrivalProfile`] reports how far ahead of
+//! real time the input delivers, and the cushion, the hard cap and the stall
+//! timeout all follow from it. That also moves the decision to start emitting off
+//! a timer and onto content, because a cushion cannot be sized against a burst
+//! whose size is not yet known — and starting mid-burst on a segmented input is
+//! what makes an ordinary inter-segment gap look like an underrun.
+//!
 //! It also tracks *content liveness* ([`SourceState`]), because stuffing to hold
 //! a rate is the right answer to a late source and the wrong answer to an absent
 //! one. Past the stall timeout the scheduler stops claiming a clock it no longer
@@ -27,7 +36,8 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::config::{Clocking, Config, DEFAULT_AUTO_FALLBACK, PcrMode};
+use crate::arrival::ArrivalProfile;
+use crate::config::{Clocking, Config, DEFAULT_AUTO_FALLBACK, Latency, PcrMode, Stall};
 use crate::jitter_buffer::JitterBuffer;
 use crate::null_insertion::{NULL_PID, null_packet, pcr_only_packet};
 use crate::observe::SourceState;
@@ -92,6 +102,16 @@ impl MediaClock {
 		}
 		self.last_pcr = Some(pcr);
 		self.packets_since_pcr = 0;
+	}
+
+	/// The content rate recovered from the source PCR, or `None` while the
+	/// estimate is still the fallback.
+	///
+	/// Only a real estimate is any use for sizing a buffer against arrival: the
+	/// fallback is derived from the configured mux rate, so comparing arrival
+	/// against it would measure the configuration rather than the stream.
+	fn estimated_rate_pps(&self) -> Option<f64> {
+		self.estimated.then_some(self.rate_pps)
 	}
 
 	/// Number of content packets that should have been released by `now`.
@@ -161,6 +181,12 @@ impl StreamGrid {
 			next_free: 0,
 			capacity: capacity.max(1),
 		}
+	}
+
+	/// Raise the placement bound to `capacity`, never lowering it. See
+	/// [`JitterBuffer::grow_to`].
+	fn grow_to(&mut self, capacity: usize) {
+		self.capacity = self.capacity.max(capacity.max(1));
 	}
 
 	/// Absolute slot for a source PCR seen after `since` of wall time, keeping the
@@ -328,7 +354,13 @@ impl StreamGrid {
 #[derive(Debug)]
 pub struct Scheduler {
 	mux_rate_bps: u64,
-	latency: Duration,
+	/// How the depths are decided: pinned, or measured from arrival.
+	latency: Latency,
+	/// The cushion currently in force, from [`Latency::target`].
+	target: Duration,
+	/// What the input's arrival pattern has been observed to be, and so what the
+	/// depths are sized against under [`Latency::Adaptive`].
+	profile: ArrivalProfile,
 	packets_per_datagram: usize,
 	buffer: JitterBuffer,
 	media: MediaClock,
@@ -361,8 +393,11 @@ pub struct Scheduler {
 	max_latency_packets: u64,
 	/// Added to the slot-derived RTP sequence number.
 	sequence_seed: u16,
-	/// Input-silence grace period before the source counts as stalled.
-	stall_timeout: Option<Duration>,
+	/// When input silence stops being jitter and becomes a dead source.
+	stall: Stall,
+	/// Wall time content first arrived, which is where the start deadline runs
+	/// from under [`Latency::Adaptive`].
+	first_content_at: Option<Instant>,
 	/// Wall time content last arrived (after stripping input stuffing).
 	last_content_at: Option<Instant>,
 	/// Whether the input was stalled as of the last output slot.
@@ -382,7 +417,10 @@ impl Scheduler {
 	pub fn new(config: &Config) -> Self {
 		let bitrate = config.resolved_bitrate().unwrap_or(DEFAULT_AUTO_FALLBACK).max(1);
 		let fallback_pps = bitrate as f64 / PACKET_BITS as f64;
-		let capacity = latency_to_packets(config.max_latency, bitrate).max(1);
+		// Nothing has arrived, so an adaptive cushion starts at its floor and
+		// grows from there; a pinned one is already what it will be.
+		let target = config.latency.target(Duration::ZERO);
+		let capacity = latency_to_packets(config.latency.cap(target), bitrate).max(1);
 		let pcr_regen = match config.pcr {
 			PcrMode::Regenerate => Some(PcrRegen::new(bitrate)),
 			PcrMode::Preserve => None,
@@ -390,6 +428,8 @@ impl Scheduler {
 		Self {
 			mux_rate_bps: bitrate,
 			latency: config.latency,
+			target,
+			profile: ArrivalProfile::new(),
 			packets_per_datagram: config.packets_per_datagram.max(1),
 			buffer: JitterBuffer::new(capacity),
 			media: MediaClock::new(fallback_pps),
@@ -405,10 +445,11 @@ impl Scheduler {
 			anchor_slot: 0,
 			slot: 0,
 			grid: (config.clocking == Clocking::Stream).then(|| StreamGrid::new(bitrate, capacity)),
-			latency_packets: latency_to_packets(config.latency, bitrate) as u64,
+			latency_packets: latency_to_packets(target, bitrate) as u64,
 			max_latency_packets: capacity as u64,
 			sequence_seed: config.sequence_seed,
-			stall_timeout: config.stall_timeout,
+			stall: config.stall,
+			first_content_at: None,
 			last_content_at: None,
 			stalled: false,
 			scratch: Vec::with_capacity(config.packets_per_datagram.max(1) * TS_PACKET_SIZE),
@@ -432,10 +473,17 @@ impl Scheduler {
 			self.resume(now);
 		}
 		self.note_content_gap(now);
+		self.first_content_at.get_or_insert(now);
 		self.last_content_at = Some(now);
 		if self.pcr_pid.is_none() && packet.has_pcr() {
 			self.pcr_pid = Some(packet.pid());
 		}
+		// Measured against the stream's own media rate, so a burst cannot inflate
+		// the rate it is being compared with. Before the second PCR there is no
+		// rate yet and the profile has nothing to say, which is why an adaptive
+		// start also has a deadline.
+		self.profile.observe(now, self.media.estimated_rate_pps().unwrap_or(0.0));
+		self.resize();
 
 		if let Some(grid) = self.grid.as_mut() {
 			let dropped = grid.push(packet, now);
@@ -462,24 +510,112 @@ impl Scheduler {
 				&& let (Some(first), Some(edge)) = (grid.first_slot(), grid.last_slot())
 			{
 				let per_datagram = self.packets_per_datagram as u64;
-				let behind = latency_to_packets(self.latency, self.mux_rate_bps) as u64;
-				let start = edge.saturating_sub(behind).max(first);
-				self.anchor = Some(self.anchor.unwrap_or(now + self.latency));
+				let start = edge.saturating_sub(self.latency_packets).max(first);
+				self.anchor = Some(self.anchor.unwrap_or(now + self.target));
 				self.anchor_slot = start - (start % per_datagram);
 				self.slot = self.anchor_slot;
 				self.stats.start_backlog = edge - first;
 			}
+			self.note_depth();
 			return;
 		}
 
-		if self.anchor.is_none() {
-			let anchor = now + self.latency;
-			self.anchor = Some(anchor);
-			self.media.anchor = Some(anchor);
-		}
 		self.media.observe(&packet);
 		if self.buffer.push(packet) {
 			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(1);
+		}
+		self.note_depth();
+		self.arm(now);
+	}
+
+	/// Record how deep the buffer got, so the bound can be judged against use.
+	fn note_depth(&mut self) {
+		let depth = self.buffered_packets() as u64;
+		self.stats.buffer_high_water = self.stats.buffer_high_water.max(depth);
+	}
+
+	/// Re-derive the depths from the arrival pattern observed so far.
+	///
+	/// A no-op under [`Latency::Fixed`]. The cushion may fall as well as rise —
+	/// a burst ages out of the measurement window — but the buffer bound only
+	/// rises, because shrinking it underneath media already accepted would drop
+	/// programme to satisfy a revised estimate.
+	fn resize(&mut self) {
+		if !matches!(self.latency, Latency::Adaptive { .. }) {
+			return;
+		}
+		self.target = self.latency.target(self.profile.lead());
+		let cap = self.latency.cap(self.target);
+		self.latency_packets = latency_to_packets(self.target, self.mux_rate_bps) as u64;
+		let capacity = latency_to_packets(cap, self.mux_rate_bps).max(1);
+		self.max_latency_packets = self.max_latency_packets.max(capacity as u64);
+		self.buffer.grow_to(capacity);
+		if let Some(grid) = self.grid.as_mut() {
+			grid.grow_to(capacity);
+		}
+	}
+
+	/// Start the output clock if it is time to, under [`Latency::Adaptive`].
+	///
+	/// Two conditions, and the second is the one a timer cannot express. The
+	/// cushion has to be full, or the pacer starts on less programme than it has
+	/// decided it needs. And the input has to be between deliveries, because the
+	/// size of a burst is not known until it ends: a segmented feed reaches a
+	/// 200 ms cushion 25 ms into a 2 s segment fetch, and a pacer that started
+	/// there would drain what it held and then read the ordinary gap before the
+	/// next segment as an underrun. Waiting for the delivery to finish is what
+	/// lets the cushion be sized against the whole burst.
+	///
+	/// A continuous feed is never mid-delivery in that sense — its lead stays
+	/// below [`crate::DELIVERY_GAP`] — so it starts as soon as it is primed,
+	/// exactly as it did before any of this existed. The deadline covers the
+	/// input that fits neither description.
+	fn arm(&mut self, now: Instant) {
+		if self.anchor.is_some() {
+			return;
+		}
+		let anchor = match self.latency.start_deadline() {
+			// Pinned depths start on a timer: the cushion is already known, so
+			// there is nothing to learn by waiting for content to prove it.
+			None => now + self.target,
+			Some(deadline) => {
+				let primed = self.buffered_packets() as u64 >= self.latency_packets;
+				let settled = !self.profile.bursty() || self.profile.between_deliveries(now);
+				let expired = self
+					.first_content_at
+					.is_some_and(|first| now.saturating_duration_since(first) >= deadline);
+				if !((primed && settled) || expired) {
+					return;
+				}
+				now
+			}
+		};
+		self.anchor = Some(anchor);
+		self.media.anchor = Some(anchor);
+	}
+
+	/// Give an unstarted output clock the chance to start without a packet having
+	/// arrived, so a cushion that filled during a delivery starts emitting in the
+	/// silence that follows rather than waiting for the next delivery to prove it.
+	///
+	/// The driver calls this while [`Scheduler::next_due`] is `None`. A no-op once
+	/// the clock is running, and under [`Latency::Fixed`], which starts on the
+	/// first packet.
+	pub fn poll_start(&mut self, now: Instant) {
+		if self.first_content_at.is_some() {
+			self.arm(now);
+		}
+	}
+
+	/// Start the output clock now, whatever the cushion holds.
+	///
+	/// For an input that ended before it delivered a cushion's worth: nothing more
+	/// is coming, so continuing to wait for it would discard the programme already
+	/// in hand rather than pace it out.
+	pub fn start_now(&mut self, now: Instant) {
+		if self.anchor.is_none() {
+			self.anchor = Some(now);
+			self.media.anchor = Some(now);
 		}
 	}
 
@@ -512,7 +648,7 @@ impl Scheduler {
 		if self.grid.is_some() {
 			return;
 		}
-		let anchor = now + self.latency;
+		let anchor = now + self.target;
 		self.media.anchor = Some(anchor);
 		self.media.released = 0;
 		// A rate sample taken across the gap would read as the outage length, not
@@ -526,7 +662,9 @@ impl Scheduler {
 		let Some(last) = self.last_content_at else {
 			return SourceState::Priming;
 		};
-		if self.anchor.is_some_and(|anchor| now < anchor) {
+		// An adaptive start holds the clock unarmed while it fills the cushion it
+		// has sized, which is priming by any reading of the word.
+		if self.anchor.is_none_or(|anchor| now < anchor) {
 			return SourceState::Priming;
 		}
 		// Buffered media is still programme going to air. The input may already be
@@ -539,13 +677,23 @@ impl Scheduler {
 			return SourceState::Live;
 		}
 		let silent = now.saturating_duration_since(last);
-		if self.stall_timeout.is_some_and(|timeout| silent >= timeout) {
+		if self.stall_timeout().is_some_and(|timeout| silent >= timeout) {
 			SourceState::Stalled
-		} else if silent >= self.latency {
+		} else if silent >= self.target {
 			SourceState::Starved
 		} else {
 			SourceState::Live
 		}
+	}
+
+	/// The silence after which the input counts as gone rather than late, given
+	/// the cushion currently in force. `None` disables stall detection.
+	///
+	/// Under [`Stall::Adaptive`] this rises and falls with the cushion, which is
+	/// the point: a leg holding four seconds of segmented programme has not lost
+	/// its source one second into an ordinary inter-segment gap.
+	pub fn stall_timeout(&self) -> Option<Duration> {
+		self.stall.timeout(self.target)
 	}
 
 	/// How long the input has carried no content, zero before the first packet.
@@ -638,8 +786,18 @@ impl Scheduler {
 	}
 
 	/// A snapshot of the pacing statistics.
+	///
+	/// The arrival and depth figures are read from live state rather than kept as
+	/// counters, since they describe what the input is doing now rather than
+	/// tallying what it has done.
 	pub fn stats(&self) -> Stats {
-		self.stats
+		Stats {
+			burst_max_packets: self.profile.burst_max_packets(),
+			bursts: self.profile.bursts(),
+			arrival_lead_ms: self.profile.lead().as_millis().min(u128::from(u64::MAX)) as u64,
+			latency_target_ms: self.target.as_millis().min(u128::from(u64::MAX)) as u64,
+			..self.stats
+		}
 	}
 
 	/// Emit one output datagram (`packets_per_datagram` transport packets) at
@@ -796,8 +954,9 @@ fn latency_to_packets(latency: Duration, bitrate: u64) -> usize {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::config::Config;
+	use crate::config::{Config, DEFAULT_LATENCY};
 	use crate::error::Error;
+	use crate::pcr::PCR_CLOCK_HZ;
 
 	const MUX_RATE: u64 = 12_000_000;
 	// 188 * 8 * 27_000_000 / 12_000_000 = 3384 ticks per packet.
@@ -1607,6 +1766,204 @@ mod tests {
 		assert!(matches!(preserved.validate(), Err(Error::Config(_))));
 		assert!(stream_config().validate().is_ok());
 		assert!(config().validate().is_ok(), "arrival clocking constrains nothing");
+	}
+
+	// --- adaptive sizing ---------------------------------------------------------
+
+	/// The mux rate in packets per second, and the media rate of the synthetic
+	/// segmented stream below (a fifth under the mux rate, as a groomed feed is).
+	const MUX_PPS: f64 = MUX_RATE as f64 / PACKET_BITS as f64;
+	const MEDIA_PPS: f64 = MUX_PPS * 0.8;
+
+	fn adaptive_config() -> Config {
+		Config::new(MUX_RATE).with_packets_per_datagram(1)
+	}
+
+	/// A contiguous stream, one PCR every `PCR_EVERY` packets, handed to `sched` a
+	/// segment at a time: `segments` deliveries of `segment` of media each, every
+	/// `segment` of wall time, each fetched in `fetch`. The PCR timeline is
+	/// continuous across the deliveries, as a segmenter's output is.
+	const PCR_EVERY: u64 = 20;
+
+	fn deliver_segments(
+		sched: &mut Scheduler,
+		t0: Instant,
+		segment: Duration,
+		fetch: Duration,
+		segments: u32,
+	) -> Instant {
+		let per_segment = (segment.as_secs_f64() * MEDIA_PPS) as u64;
+		let mut index = 0_u64;
+		for n in 0..segments {
+			let at = t0 + segment.mul_f64(f64::from(n));
+			for i in 0..per_segment {
+				let pcr = index * (PCR_CLOCK_HZ / MEDIA_PPS as u64);
+				let packet = content_packet(0x100, (index % PCR_EVERY == 0).then_some(pcr));
+				sched.enqueue(packet, at + fetch.mul_f64(i as f64 / per_segment as f64));
+				index += 1;
+			}
+		}
+		t0 + segment.mul_f64(f64::from(segments))
+	}
+
+	#[test]
+	fn a_segmented_input_sizes_its_own_cushion() {
+		// The whole point of §9.1: fed a feed that arrives a segment at a time, the
+		// pacer works out that it needs seconds of buffer rather than the
+		// milliseconds a continuous feed needs, without being told.
+		let mut sched = Scheduler::new(&adaptive_config());
+		let t0 = Instant::now();
+		deliver_segments(&mut sched, t0, Duration::from_secs(2), Duration::from_millis(300), 3);
+
+		let stats = sched.stats();
+		assert!(
+			(1_500..2_100).contains(&stats.arrival_lead_ms),
+			"expected a lead near the segment duration, got {} ms",
+			stats.arrival_lead_ms
+		);
+		assert!(
+			(4_000..8_001).contains(&stats.latency_target_ms),
+			"expected a cushion of several seconds, got {} ms",
+			stats.latency_target_ms
+		);
+		// And the derived stall timeout is past the doubled gap a segment fetcher
+		// produces when it misses a publish cycle.
+		let timeout = sched.stall_timeout().expect("a derived timeout");
+		assert!(
+			timeout >= Duration::from_secs(4),
+			"a 4 s inter-segment gap would still mute at {timeout:?}"
+		);
+	}
+
+	#[test]
+	fn a_continuous_input_keeps_the_millisecond_cushion() {
+		// The regression guard: serving a segmented plane must cost the object
+		// plane nothing. A feed delivered at the media rate never gets ahead, so
+		// adaptive sizing leaves it on the floor and the run is indistinguishable
+		// from one on a pinned 200 ms cushion.
+		let mut sched = Scheduler::new(&adaptive_config());
+		let t0 = Instant::now();
+		let slot = Duration::from_secs_f64(1.0 / MUX_PPS);
+		let per_packet = Duration::from_secs_f64(1.0 / MEDIA_PPS);
+		let mut delivered = 0_u64;
+
+		// Interleaved, as a live run is: input trickles in at the media rate while
+		// the output byte clock runs at the mux rate.
+		for output in 0..(20.0 * MUX_PPS) as u64 {
+			let now = t0 + slot.mul_f64(output as f64);
+			while per_packet.mul_f64(delivered as f64) <= now.saturating_duration_since(t0) {
+				let pcr = delivered * (PCR_CLOCK_HZ / MEDIA_PPS as u64);
+				let packet = content_packet(0x100, (delivered % PCR_EVERY == 0).then_some(pcr));
+				sched.enqueue(packet, now);
+				delivered += 1;
+			}
+			if sched.next_due().is_some() {
+				sched.emit_datagram(now);
+			}
+		}
+
+		let stats = sched.stats();
+		assert_eq!(
+			stats.latency_target_ms,
+			DEFAULT_LATENCY.as_millis() as u64,
+			"a continuous feed must stay on the configured floor (lead {} ms)",
+			stats.arrival_lead_ms
+		);
+		assert_eq!(stats.dropped_packets, 0, "and must not have its buffer tightened");
+		assert_eq!(stats.stalls, 0, "nor be read as a dead source");
+		assert!(
+			stats.buffer_high_water < (DEFAULT_LATENCY.as_secs_f64() * MEDIA_PPS * 2.0) as u64,
+			"the cushion grew to {} packets on a feed that never got ahead",
+			stats.buffer_high_water
+		);
+	}
+
+	#[test]
+	fn the_start_gate_waits_out_a_delivery_before_committing() {
+		// A segmented feed reaches a 200 ms cushion a few milliseconds into a 2 s
+		// segment fetch. Starting there is what makes the ordinary gap before the
+		// next segment read as an underrun, so the gate has to wait for the
+		// delivery to end — at which point the burst has sized the cushion, and the
+		// cushion is deeper than what is in hand.
+		let mut sched = Scheduler::new(&adaptive_config());
+		let t0 = Instant::now();
+		deliver_segments(&mut sched, t0, Duration::from_secs(2), Duration::from_millis(300), 1);
+		assert!(
+			sched.next_due().is_none(),
+			"the clock started on one segment, holding {} ms against a {} ms cushion",
+			(sched.buffered_packets() as f64 / MEDIA_PPS * 1000.0) as u64,
+			sched.stats().latency_target_ms
+		);
+		assert_eq!(sched.state(t0 + Duration::from_secs(1)), SourceState::Priming);
+
+		// Enough deliveries to fill the cushion it decided on, and it starts.
+		deliver_segments(&mut sched, t0, Duration::from_secs(2), Duration::from_millis(300), 5);
+		sched.poll_start(t0 + Duration::from_secs(10));
+		assert!(sched.next_due().is_some(), "the clock never started");
+	}
+
+	#[test]
+	fn a_pinned_cushion_still_starts_on_a_timer() {
+		// Setting a depth explicitly turns the content gate off: the operator has
+		// said how deep the buffer is, so there is nothing to learn by waiting.
+		let cfg = adaptive_config().with_latency(Duration::from_millis(50));
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+		assert_eq!(
+			sched.next_due(),
+			Some(t0 + Duration::from_millis(50)),
+			"a pinned cushion arms on the first packet"
+		);
+	}
+
+	#[test]
+	fn a_segment_larger_than_the_buffer_is_not_dropped() {
+		// The failure that made a groomer configured for an object transport
+		// unusable on a segmented one: a 2 s segment against a 2 s buffer bound
+		// overflows on arrival, so the groomer deletes programme from a healthy
+		// feed, once per segment, silently.
+		let mut sched = Scheduler::new(&adaptive_config());
+		let t0 = Instant::now();
+		deliver_segments(&mut sched, t0, Duration::from_secs(2), Duration::from_millis(300), 4);
+		assert_eq!(
+			sched.stats().dropped_packets,
+			0,
+			"dropped programme from a healthy segmented feed"
+		);
+		assert!(
+			sched.stats().buffer_high_water > (2.0 * MEDIA_PPS) as u64,
+			"the buffer never held a whole segment: high water {}",
+			sched.stats().buffer_high_water
+		);
+	}
+
+	#[test]
+	fn a_long_gap_on_a_contiguous_stream_is_not_a_splice() {
+		// A segment fetcher that misses a publish cycle waits two periods and then
+		// collects both segments, so the stream it hands over is contiguous however
+		// long the silence was. Nothing may read that silence as a source
+		// discontinuity: a spurious re-base steps the emitted PCR off the byte
+		// clock, which is the one thing a groomer exists to guarantee.
+		let cfg = adaptive_config().with_pcr_mode(PcrMode::Regenerate);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		let segment = Duration::from_secs(6);
+		// Two deliveries twelve seconds apart: one missed publish cycle at the
+		// longest segment duration the lab measured.
+		deliver_segments(&mut sched, t0, segment * 2, Duration::from_millis(900), 2);
+
+		let mut now = t0;
+		let mut flagged = 0;
+		for _ in 0..(30.0 * MUX_PPS) as u64 {
+			let datagram = sched.emit_datagram(now).to_vec();
+			if pcr::read_pcr(&datagram).is_some() && datagram[5] & 0x80 != 0 {
+				flagged += 1;
+			}
+			now += Duration::from_secs_f64(1.0 / MUX_PPS);
+		}
+		assert_eq!(sched.stats().pcr_rebases, 0, "the silence was read as a splice");
+		assert_eq!(flagged, 0, "{flagged} PCRs falsely flagged discontinuous");
 	}
 
 	#[test]

@@ -34,7 +34,7 @@ pub struct Stats {
 	/// Byte-locked PCR-only packets inserted to hold the repetition limit.
 	pub pcr_inserted: u64,
 	/// Times the input went silent past
-	/// [`Config::stall_timeout`](crate::Config::stall_timeout). A non-zero value
+	/// [`Config::stall`](crate::Config::stall). A non-zero value
 	/// means the source died (or paused) at least once, whatever the carrier
 	/// looked like.
 	pub stalls: u64,
@@ -71,6 +71,45 @@ pub struct Stats {
 	/// that joined one already running says the relay served it from well behind
 	/// the live edge, which is where its phase relative to a partner comes from.
 	pub start_backlog: u64,
+
+	/// Largest burst the input delivered, in 188-byte packets, grouping arrivals
+	/// separated by more than [`BURST_SEPARATION`](crate::BURST_SEPARATION).
+	///
+	/// This is the pacer measuring the burstiness of its own input, at the same
+	/// grouping threshold an external cadence instrument would use, so the two are
+	/// comparable. It is the figure that differs by two orders of magnitude
+	/// between data planes: tens of kilobytes on an object transport, megabytes on
+	/// a segment-fetching one.
+	pub burst_max_packets: u64,
+
+	/// Bursts the input delivered, at the same grouping threshold.
+	///
+	/// With `burst_max_packets` and `content_gap_max_ms` this is the arrival
+	/// pattern in three numbers: how many deliveries, how big the largest, and how
+	/// long the longest silence between them.
+	pub bursts: u64,
+
+	/// Largest lead the input built, in milliseconds — the media it handed over
+	/// ahead of real time, and so the buffer occupancy its arrival pattern forces.
+	///
+	/// Near zero on a feed delivered at the media rate, whatever its burst size;
+	/// about one segment duration on a feed fetched a segment at a time. This is
+	/// what an adaptive cushion is sized from.
+	pub arrival_lead_ms: u64,
+
+	/// De-jitter cushion currently in force, in milliseconds.
+	///
+	/// Fixed for the run under [`Latency::Fixed`](crate::Latency); under
+	/// [`Latency::Adaptive`](crate::Latency) it is what the pacer concluded it
+	/// needed from `arrival_lead_ms`, and worth logging next to it.
+	pub latency_target_ms: u64,
+
+	/// Deepest the de-jitter buffer ever got, in 188-byte packets.
+	///
+	/// Against the configured or derived bound, this says how much of the buffer
+	/// the input actually used. Sitting at the bound with `dropped_packets`
+	/// climbing means the bound is too low for the arrival pattern.
+	pub buffer_high_water: u64,
 }
 
 impl Stats {

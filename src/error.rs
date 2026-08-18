@@ -27,7 +27,7 @@ pub enum Error {
 	Config(&'static str),
 
 	/// The source delivered no content for longer than
-	/// [`Config::stall_timeout`](crate::Config::stall_timeout), under
+	/// [`Config::stall`](crate::Config::stall), under
 	/// [`StallPolicy::Fail`](crate::StallPolicy::Fail). A stalled source is not an
 	/// I/O error: the transport is usually still open and simply silent, which is
 	/// why it needs its own variant.

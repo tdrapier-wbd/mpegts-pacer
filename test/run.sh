@@ -13,6 +13,8 @@
 #   ./run.sh --bitrate 12000000   # force the target mux rate (default: source * 1.2)
 #   ./run.sh --pcr preserve       # preserve source PCR instead of byte-locking
 #   ./run.sh --strict             # also fail on broadcast-shape warnings
+#   ./run.sh --bursty             # also run the arm that delivers in segment bursts
+#   ./run.sh --bursty --segment-ms 6000
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -26,6 +28,8 @@ PCR_MODE="regenerate"
 PCR_JITTER_US="${TSP_PCR_JITTER_US:-500}"
 PROFILE="${TSP_PROFILE:-release}"
 STRICT=""
+BURSTY=""
+SEGMENT_MS="${TSP_SEGMENT_MS:-2000}"
 PASSTHRU=()
 
 FFMPEG="${FFMPEG_BIN:-ffmpeg}"
@@ -38,6 +42,8 @@ while [[ $# -gt 0 ]]; do
         --pcr) PCR_MODE="$2"; shift 2 ;;
         --pcr-jitter-us) PCR_JITTER_US="$2"; shift 2 ;;
         --strict) STRICT="--strict"; shift ;;
+        --bursty) BURSTY="1"; shift ;;
+        --segment-ms) SEGMENT_MS="$2"; shift 2 ;;
         *) PASSTHRU+=("$1"); shift ;;
     esac
 done
@@ -66,6 +72,7 @@ trap cleanup EXIT
 
 SRC_TS="$TMP/source.ts"
 PACED_TS="$TMP/paced.ts"
+BURST_TS="$TMP/burst.ts"
 
 if [[ -n "$SOURCE" ]]; then
     [[ -f "$SOURCE" ]] || { echo "error: no such source: $SOURCE" >&2; exit 1; }
@@ -102,11 +109,14 @@ echo "### target mux rate ${BITRATE} b/s, PCR mode ${PCR_MODE}"
 echo "### building mpegts-pacer (${PROFILE})"
 flag=()
 [[ "$PROFILE" == "release" ]] && flag=(--release)
-(cd "$WORKSPACE" && cargo build ${flag[@]+"${flag[@]}"} -p mpegts-pacer --example cbr_file)
+EXAMPLES=(--example cbr_file)
+[[ -n "$BURSTY" ]] && EXAMPLES+=(--example burst_replay)
+(cd "$WORKSPACE" && cargo build ${flag[@]+"${flag[@]}"} -p mpegts-pacer "${EXAMPLES[@]}")
 TARGET_BASE=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE/Cargo.toml" --no-deps |
     sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 [[ -n "$TARGET_BASE" ]] || { echo "error: could not resolve cargo target directory" >&2; exit 1; }
 BIN="$TARGET_BASE/$PROFILE/examples/cbr_file"
+BURST_BIN="$TARGET_BASE/$PROFILE/examples/burst_replay"
 
 echo "### pacing $SRC_TS -> $PACED_TS"
 "$BIN" "$SRC_TS" "$PACED_TS" "$BITRATE" "$PCR_MODE"
@@ -135,3 +145,32 @@ echo
 # rate passes every other timing check).
 echo "### compliance report"
 python3 "$COMPLIANCE" --ts "$PACED_TS" --reference "$SRC_TS" $STRICT ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+
+# The arm above cannot test burst absorption: cbr_file drives the scheduler on a
+# synthetic clock derived from the source PCR, so it has no arrival timing at all,
+# and buffer sizing, the start gate and stall detection are all functions of when
+# packets turn up. This one replays the same clip through the live pacer the way a
+# segment-fetching client delivers it, and puts the output through the same gates.
+# It runs in real time, so it costs the clip's own duration.
+if [[ -n "$BURSTY" ]]; then
+    echo
+    echo "### bursty arm: replaying in ${SEGMENT_MS} ms segments through the live pacer"
+    "$BURST_BIN" "$SRC_TS" "$BURST_TS" "$BITRATE" --segment-ms "$SEGMENT_MS"
+    echo
+
+    echo "### pcrverify on burst-delivered input (jitter-max ${PCR_JITTER_US} us)"
+    PCRV=$(tsp -I file "$BURST_TS" -P pcrverify --jitter-max "$PCR_JITTER_US" -O drop 2>&1 | tail -1)
+    echo "  $PCRV"
+    OVER=$(echo "$PCRV" | sed -n 's/.*OK, \([0-9,]*\) with jitter.*/\1/p' | tr -d ',')
+    if [[ -n "$OVER" && "$OVER" -gt 0 ]]; then
+        echo "error: $OVER PCR(s) exceeded the ${PCR_JITTER_US} us tolerance on burst-delivered input" >&2
+        exit 1
+    fi
+    echo
+
+    # No --reference here: the live arm starts emitting only once it holds the
+    # cushion it sized, so its output is deliberately shorter than the source by
+    # the startup wait, and a duration comparison would read that as a fault.
+    echo "### compliance report (bursty arm)"
+    python3 "$COMPLIANCE" --ts "$BURST_TS" $STRICT ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+fi

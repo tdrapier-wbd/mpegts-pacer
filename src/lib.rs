@@ -1,10 +1,28 @@
 //! Transport-agnostic MPEG-TS constant-bitrate pacer for broadcast (IRD) egress.
 //!
-//! Modern IP transports (MoQ, SRT, RIST, RTP, file playback) deliver MPEG-TS in
-//! bursts. Professional Integrated Receiver/Decoders (IRDs) expect a smooth,
-//! constant-bitrate transport with byte-accurate PCR. This crate is the missing
-//! adaptation layer between the two: feed it already-multiplexed transport
+//! Modern IP transports (MoQ, SRT, RIST, segmented HTTP, file playback) deliver
+//! MPEG-TS in bursts. Professional Integrated Receiver/Decoders (IRDs) expect a
+//! smooth, constant-bitrate transport with byte-accurate PCR. This crate is the
+//! missing adaptation layer between the two: feed it already-multiplexed transport
 //! packets and it emits a deterministic CBR stream a hardware IRD will accept.
+//!
+//! # Buffer depth
+//!
+//! Burst granularity differs by two orders of magnitude between transports. An
+//! object transport arrives in kilobyte bursts milliseconds apart; a
+//! segment-fetching one arrives in megabyte bursts seconds apart. A pacer set for
+//! the first and fed the second drops programme out of a healthy feed on every
+//! segment, starts on a timer holding a fraction of what it needs, and reads every
+//! ordinary inter-segment gap as a dead source.
+//!
+//! So by default the depths are measured rather than configured. The pacer tracks
+//! how much media its input hands over *ahead of real time* — which is precisely
+//! the occupancy the arrival pattern forces — and derives the cushion, the hard cap
+//! and the stall timeout from it. A feed delivered at the media rate never gets
+//! ahead, so it stays on the 200 ms floor and behaves exactly as it always has;
+//! a feed fetched a segment at a time settles on a multiple of the segment
+//! duration. See [`Latency`] for the mechanism and its costs, and pin any depth to
+//! turn it off.
 //!
 //! It is **not** a muxer. It never demultiplexes, remultiplexes, rewrites PSI,
 //! regenerates PAT/PMT, or touches continuity counters. PID structure and
@@ -58,7 +76,7 @@
 //! a monitor or a 1+1 receiver keys on (arrival, loss, continuity) reads healthy.
 //!
 //! So the pacer tracks when content last *arrived*, not just what it emitted. Past
-//! [`Config::stall_timeout`] the source is treated as gone: no PCR is inserted
+//! what [`Config::stall`] allows the source is treated as gone: no PCR is inserted
 //! into a programme-free stream, and [`Config::stall_policy`] decides what happens
 //! to the carrier — by default [`StallPolicy::Mute`], which stops emitting while
 //! holding the output byte clock, and resumes when content returns.
@@ -91,6 +109,7 @@
 //! Getting the second wrong is invisible: the leg comes back, its numbering is
 //! right, and every packet it carries lands in a slot that has already gone.
 
+mod arrival;
 mod config;
 mod error;
 mod estimate;
@@ -106,9 +125,11 @@ mod slot;
 mod source;
 mod stats;
 
+pub use arrival::{BURST_SEPARATION, DELIVERY_GAP};
 pub use config::{
-	Bitrate, Clocking, Config, DEFAULT_AUTO_FALLBACK, DEFAULT_AUTO_HEADROOM, DEFAULT_LATENCY, DEFAULT_MAX_LATENCY,
-	DEFAULT_PACKETS_PER_DATAGRAM, DEFAULT_STALL_TIMEOUT, PcrMode, StallPolicy,
+	Bitrate, Clocking, Config, DEFAULT_AUTO_FALLBACK, DEFAULT_AUTO_HEADROOM, DEFAULT_LATENCY,
+	DEFAULT_LATENCY_CEILING, DEFAULT_LATENCY_FACTOR, DEFAULT_MAX_LATENCY, DEFAULT_PACKETS_PER_DATAGRAM,
+	DEFAULT_STALL_GRACE, Latency, PcrMode, Stall, StallPolicy,
 };
 pub use error::{Error, Result};
 pub use estimate::estimate_content_bitrate;
