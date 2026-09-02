@@ -831,8 +831,8 @@ impl Scheduler {
 	/// The bound is `max_latency` because that is the point at which the existing
 	/// behaviour stops being a deferral and starts being a loss: below it the
 	/// displacement is spilled packets waiting in a buffer that is allowed to be
-	/// that deep, and above it the live edge outruns the output clock, so
-	/// [`Scheduler::catch_up`] moves the clock and the skipped slots are dropped.
+	/// that deep, and above it the live edge outruns the output clock, so the
+	/// catch-up path moves the clock and the skipped slots are dropped.
 	/// Always `false` under [`Clocking::Arrival`], which has no grid to displace.
 	pub fn pcr_position_diverged(&self) -> bool {
 		self.grid
