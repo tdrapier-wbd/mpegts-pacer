@@ -64,6 +64,44 @@ pub enum StallPolicy {
 	Fail,
 }
 
+/// What to do when a source's PCR byte positions do not advance with its PCR
+/// values, under [`Clocking::Stream`].
+///
+/// Stream clocking spreads each run of packets across the slot span its two
+/// bounding PCR *values* imply, which assumes the source's PCR *positions*
+/// advance with those values. Value cadence and positional cadence are separate
+/// properties of a source: one can be exact while the other is degenerate, and a
+/// source holding a perfect PCR value grid at clustered byte positions passes
+/// every check on its values while breaking the placement.
+///
+/// The failure is silent by default, and that is the reason this exists. The
+/// displaced grid makes the leg's live edge outrun its own output clock, which
+/// trips a resync and discards programme by slot — and a resync reads as a
+/// configured rate below the content rate, which for this input is the wrong
+/// diagnosis and points at a knob that cannot fix it. Either way the counters are
+/// always kept: see [`Stats::pcr_position_displacement`](crate::Stats::pcr_position_displacement).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PcrPositionPolicy {
+	/// Carry on, and report it through the counters and the observer.
+	///
+	/// The default, because the existing behaviour absorbs a genuine rate peak
+	/// this way and a peak is indistinguishable from a pathology until the
+	/// displacement fails to decay.
+	#[default]
+	Report,
+
+	/// Stop and return
+	/// [`Error::SourcePcrPosition`](crate::Error::SourcePcrPosition) once the
+	/// displacement exceeds `max_latency`, i.e. once it can no longer be absorbed
+	/// and the grid has started deleting programme to stay inside the buffer.
+	///
+	/// For a groomer feeding a 1+1 pair this is the safer setting: the output it
+	/// would otherwise produce holds an exact byte-locked PCR over a stream that
+	/// has silently lost content, which is precisely the shape that passes a
+	/// downstream conformance check while being wrong.
+	Fail,
+}
+
 /// What decides *which* packet occupies each output slot.
 ///
 /// Both modes hold the wire at the configured constant rate, and in both the wall
@@ -259,6 +297,10 @@ pub struct Config {
 	/// be a function of stream position. Both legs of a pair must use the same
 	/// seed. Ignored in [`Clocking::Arrival`].
 	pub sequence_seed: u16,
+
+	/// What to do when the source's PCR byte positions do not advance with its
+	/// PCR values, under [`Clocking::Stream`]. See [`PcrPositionPolicy`].
+	pub pcr_position_policy: PcrPositionPolicy,
 }
 
 /// Default packets per output datagram: 7 * 188 = 1316 bytes.
@@ -396,6 +438,7 @@ impl Config {
 			stall_policy: StallPolicy::default(),
 			clocking: Clocking::default(),
 			sequence_seed: 0,
+			pcr_position_policy: PcrPositionPolicy::default(),
 		}
 	}
 
@@ -509,6 +552,13 @@ impl Config {
 	/// Set the RTP sequence seed used in [`Clocking::Stream`].
 	pub fn with_sequence_seed(mut self, seed: u16) -> Self {
 		self.sequence_seed = seed;
+		self
+	}
+
+	/// Set what to do when the source's PCR positions do not track its PCR
+	/// values. See [`PcrPositionPolicy`].
+	pub fn with_pcr_position_policy(mut self, policy: PcrPositionPolicy) -> Self {
+		self.pcr_position_policy = policy;
 		self
 	}
 

@@ -134,6 +134,7 @@ Build a `Config` with `Config::new(bitrate)` (explicit rate) or `Config::auto()`
 | `.with_stall_timeout(o)` | `Option<Duration>` | -- | **Pin** how long the input may carry no content before it counts as gone rather than late. `None` disables detection (carrier forever). |
 | `.with_stall_grace(d)` | `Duration` | 1000 ms | Derive the stall timeout as the cushion in force plus this. The default. |
 | `.with_stall_policy(p)` | `StallPolicy` | `Mute` | What to do once stalled (see [Content liveness](#content-liveness)). |
+| `.with_pcr_position_policy(p)` | `PcrPositionPolicy` | `Report` | What to do when the source's PCR byte positions stop tracking its PCR values by more than the buffer can absorb (see [The positional assumption](#the-positional-assumption-and-the-guard-on-it)). |
 
 ### Buffer depth
 
@@ -354,6 +355,50 @@ late it was, reintroducing exactly the per-process variation the mode removes. A
 climbing count means the release latency is short for the path's jitter -- and
 the partner leg, which got the packet in time, covers for it.
 
+### The positional assumption, and the guard on it
+
+Stream clocking reads one PCR interval as *both* a duration and a length: the
+values say how much media time the interval spans, and the packets between them
+are assumed to be roughly what that much media time is worth at the locked rate.
+Every source that muxes as it encodes satisfies this, so the assumption sat
+unstated for a long time.
+
+**It is an assumption about the source and not a property of PCR.** The two
+cadences are independent, and a source can put its PCR values on a perfect grid
+while placing the packets that carry them anywhere -- for instance by emitting a
+whole coded frame as one write and stamping the clock between frames. Then the
+values ask for a slot far ahead of where the bytes for that slot actually are,
+placement runs past the grid, and the arriving content is late for slots that
+have already been emitted as stuffing. The output *looks* like a paced stream:
+the rate is right and the PCR is exact by construction, but most of the programme
+is missing and the discontinuities are the pacer's own.
+
+So the grid now measures the divergence rather than assuming it away. Each
+interval's placement is compared against its own span, and two counters are kept:
+
+- `pcr_position_overruns` -- intervals whose packets ran past their own span.
+  Non-zero for any VBR peak, and on its own it means nothing.
+- `pcr_position_displacement` -- the high-water mark of how far past the grid
+  placement ever got, in packets, also reported in ms at the locked rate. This is
+  the one that separates a peak from a defect: a peak's displacement is bounded
+  and gives itself back on the next trough, while a source whose positions do not
+  track its values displaces monotonically.
+
+Displacement is compared against the buffer, because that is what the question
+turns on: a displacement the cushion can absorb is a peak the pacer handles, and
+one larger than `max_latency` is content that cannot arrive in time no matter how
+correct the rest of the configuration is. When it is exceeded:
+
+- **`PcrPositionPolicy::Report`** (default) prints the counters at the end of the
+  run with the rest of the stats, and paces on. Existing behaviour is unchanged
+  -- nothing that worked before now fails.
+- **`PcrPositionPolicy::Fail`** (`--require-pcr-position`) stops with
+  `Error::SourcePcrPosition`, naming the displacement and the overrun count.
+
+Prefer `Fail` wherever the output is a contribution feed and a silently thinned
+stream is worse than no stream. Where the source is known and its peaks are
+merely large, the fix is a cushion past the displacement rather than the flag.
+
 ## Sources and sinks
 
 Built-in `Source`s:
@@ -400,6 +445,14 @@ figure adaptive sizing works from), `latency_target_ms` (the cushion the pacer
 settled on) and `buffer_high_water` (how much of the bound the input actually
 used). `buffer_high_water` sitting at the bound with `dropped_packets` climbing
 means the bound is too low for the pattern.
+
+Two describe the *source's own PCR placement*, which is the one input property
+stream clocking depends on and cannot verify from the values alone:
+`pcr_position_overruns` and `pcr_position_displacement` (also as
+`pcr_position_displacement_ms`). See
+[The positional assumption](#the-positional-assumption-and-the-guard-on-it) —
+the displacement is the figure to read, and it is meaningful against
+`max_latency` rather than in isolation.
 
 ## Command line
 
@@ -461,7 +514,7 @@ Arguments (`mpegts-pacer --help`):
 mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
              [--segment-ms N] [--latency-ms N] [--max-latency-ms N] [--latency-ceiling-ms N]
              [--ssrc N] [--stall-ms N] [--stall-grace-ms N] [--on-stall mute|continue|fail]
-             [--stream-clock] [--sequence-seed N]
+             [--stream-clock] [--sequence-seed N] [--require-pcr-position]
 ```
 
 - `<-|stdout|dest_ip:port>` -- `-` or `stdout` to write raw TS to a pipe, or a
@@ -491,6 +544,10 @@ mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
   Requires an explicit bitrate and an explicit `--latency-ms` or `--segment-ms`.
 - `--sequence-seed N` -- RTP sequence offset (default 0), identical on both legs
   of a pair.
+- `--require-pcr-position` -- refuse a source whose PCR byte positions do not
+  track its PCR values by more than the buffer can absorb, instead of pacing it
+  and reporting the divergence at the end (see
+  [The positional assumption](#the-positional-assumption-and-the-guard-on-it)).
 
 ### ffplay and "RTP: dropping old packet received too late"
 

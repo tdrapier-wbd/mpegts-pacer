@@ -129,7 +129,7 @@ pub use arrival::{BURST_SEPARATION, DELIVERY_GAP};
 pub use config::{
 	Bitrate, Clocking, Config, DEFAULT_AUTO_FALLBACK, DEFAULT_AUTO_HEADROOM, DEFAULT_LATENCY, DEFAULT_LATENCY_CEILING,
 	DEFAULT_LATENCY_FACTOR, DEFAULT_MAX_LATENCY, DEFAULT_PACKETS_PER_DATAGRAM, DEFAULT_STALL_GRACE, Latency, PcrMode,
-	Stall, StallPolicy,
+	PcrPositionPolicy, Stall, StallPolicy,
 };
 pub use error::{Error, Result};
 pub use estimate::estimate_content_bitrate;

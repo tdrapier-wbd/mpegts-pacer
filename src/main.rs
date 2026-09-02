@@ -35,8 +35,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use mpegts_pacer::{
-	CallbackObserver, Clocking, Config, DEFAULT_LATENCY, DEFAULT_LATENCY_FACTOR, Health, Latency, PcrMode, ReadSource,
-	RtpSink, SourceState, StallPolicy, Stats, TS_PACKET_SIZE, UdpSink, WriteSink, pace_with,
+	CallbackObserver, Clocking, Config, DEFAULT_LATENCY, DEFAULT_LATENCY_FACTOR, Health, Latency, PcrMode,
+	PcrPositionPolicy, ReadSource, RtpSink, SourceState, StallPolicy, Stats, TS_PACKET_SIZE, UdpSink, WriteSink,
+	pace_with,
 };
 
 const USAGE: &str = "\
@@ -64,6 +65,8 @@ Reads a transport stream on stdin and writes it out at a constant bitrate.
 
   --stream-clock           place packets by stream position, for an ST 2022-7 pair
   --sequence-seed N        first RTP sequence number, for a stream-clocked pair
+  --require-pcr-position   fail if the source's PCR byte positions do not track
+                           its PCR values by more than the buffer can absorb
 
   -h, --help               print this
   -V, --version            print the version";
@@ -147,6 +150,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	let mut stall_policy = None;
 	let mut clocking = Clocking::Arrival;
 	let mut sequence_seed = 0;
+	let mut pcr_position_policy = PcrPositionPolicy::default();
 
 	let mut at = 2;
 	while let Some(arg) = args.get(at) {
@@ -183,6 +187,11 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 			// and an explicit latency.
 			"--stream-clock" => clocking = Clocking::Stream,
 			"--sequence-seed" => sequence_seed = number(args, &mut at, "--sequence-seed")?,
+			// Refuse a source whose PCR positions do not track its PCR values,
+			// rather than emitting a byte-locked clock over a stream the grid has
+			// silently started dropping. Off by default: the same behaviour
+			// absorbs a genuine rate peak, and a peak is legitimate.
+			"--require-pcr-position" => pcr_position_policy = PcrPositionPolicy::Fail,
 			other => return Err(usage(format!("unknown argument {other:?}"))),
 		}
 	}
@@ -197,7 +206,8 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	}
 	.with_pcr_mode(pcr)
 	.with_clocking(clocking)
-	.with_sequence_seed(sequence_seed);
+	.with_sequence_seed(sequence_seed)
+	.with_pcr_position_policy(pcr_position_policy);
 
 	// Order matters: the segment duration sets both depths, so an explicit
 	// latency or cap after it refines what it chose rather than being overwritten.
@@ -381,4 +391,16 @@ fn report(stats: &Stats) {
 		stats.latency_target_ms,
 		stats.buffer_high_water,
 	);
+	// Reported separately and unconditionally, because the symptom otherwise
+	// arrives as `resyncs` above and reads as a rate set too low. A non-zero
+	// displacement says the source's PCR positions do not track its PCR values,
+	// which no amount of extra rate fixes.
+	if stats.pcr_position_overruns > 0 {
+		eprintln!(
+			"mpegts-pacer: pcr position. overrun_intervals={} displacement={} packets ({} ms at rate) \
+			 -- source PCR positions do not track its values; size the buffer past the displacement \
+			 or use --require-pcr-position",
+			stats.pcr_position_overruns, stats.pcr_position_displacement, stats.pcr_position_displacement_ms,
+		);
+	}
 }

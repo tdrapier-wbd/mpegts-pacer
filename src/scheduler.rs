@@ -165,6 +165,11 @@ struct StreamGrid {
 	/// mux rate has room for spills into the slots after it rather than losing
 	/// the excess; see [`StreamGrid::close_run`].
 	next_free: u64,
+	/// Runs that carried more packets than their own PCR span had slots for.
+	overruns: u64,
+	/// How far `next_free` ran past the slot the next source PCR asks for, at its
+	/// worst. See [`Stats::pcr_position_displacement`].
+	displacement_high_water: u64,
 	capacity: usize,
 }
 
@@ -179,6 +184,8 @@ impl StreamGrid {
 			epoch: 0,
 			last_span: None,
 			next_free: 0,
+			overruns: 0,
+			displacement_high_water: 0,
 			capacity: capacity.max(1),
 		}
 	}
@@ -266,13 +273,33 @@ impl StreamGrid {
 
 	/// Spread the open run between its own slot and `next_slot`.
 	///
-	/// A PCR interval can carry more packets than the mux rate has slots for —
-	/// video is not flat, and a groomer is normally provisioned against the
-	/// average rate rather than the peak. The excess spills into the slots after
-	/// the run instead of being discarded, and later runs start from the first
-	/// free slot, so a peak is absorbed by the stuffing that follows it and the
-	/// stream catches back up. Placement stays a function of the delivered
+	/// **The assumption this makes, stated because it is not the same assumption
+	/// as "the source's PCR values are correct".** A run is spread across the slot
+	/// span its two bounding PCR *values* imply, so the placement is only faithful
+	/// while the source's PCR *byte positions* advance with those values — while
+	/// comparable spans of media time carry comparable numbers of bytes. Value
+	/// cadence and positional cadence are separate properties of a source and are
+	/// not interchangeable: a source can hold an exact 25 ms PCR value grid while
+	/// emitting the packets that carry it back-to-back, with the media bytes they
+	/// label heaped between the clusters. Every check on the values passes, and
+	/// this function is then handed runs of one packet across a full span,
+	/// alternating with runs of thousands across the same span.
+	///
+	/// A PCR interval can legitimately carry more packets than the mux rate has
+	/// slots for — video is not flat, and a groomer is normally provisioned against
+	/// the average rate rather than the peak. The excess spills into the slots
+	/// after the run instead of being discarded, and later runs start from the
+	/// first free slot, so a peak is absorbed by the stuffing that follows it and
+	/// the stream catches back up. Placement stays a function of the delivered
 	/// packets alone, which is what keeps two legs identical.
+	///
+	/// That recovery is what separates the two cases, so it is measured rather
+	/// than assumed. A peak displaces the grid once and the displacement decays; a
+	/// source whose positional cadence does not track its value cadence displaces
+	/// it further every cycle. `displacement_high_water` is that difference, and
+	/// [`Stats::pcr_position_displacement`] is where it surfaces — because the
+	/// symptom otherwise arrives as a climbing `resyncs`, which reads as a rate
+	/// that is too low and is not.
 	fn close_run(&mut self, next_slot: u64) -> u64 {
 		let Some((_, open_slot)) = self.open else {
 			return 0;
@@ -283,6 +310,9 @@ impl StreamGrid {
 		}
 		let span = next_slot.saturating_sub(open_slot);
 		self.last_span = Some((span, count));
+		if count as u64 > span {
+			self.overruns = self.overruns.saturating_add(1);
+		}
 		let mut dropped = 0;
 		for (index, packet) in self.run.drain(..).enumerate() {
 			let ideal = open_slot + (index as u64).saturating_mul(span) / count as u64;
@@ -294,7 +324,22 @@ impl StreamGrid {
 				dropped += 1;
 			}
 		}
+		// Measured against where the *next* PCR asks the grid to be, not against
+		// this run's own span, so a run that spills and is then absorbed reads as
+		// zero on the following interval instead of accumulating.
+		let displacement = self.next_free.saturating_sub(next_slot);
+		self.displacement_high_water = self.displacement_high_water.max(displacement);
 		dropped
+	}
+
+	/// How far placement has run past the source's own PCR grid, at its worst.
+	fn displacement_high_water(&self) -> u64 {
+		self.displacement_high_water
+	}
+
+	/// Runs that carried more packets than their own PCR span had slots for.
+	fn overruns(&self) -> u64 {
+		self.overruns
 	}
 
 	/// Place a run left open by the end of the source, at the previous run's
@@ -489,6 +534,8 @@ impl Scheduler {
 		if let Some(grid) = self.grid.as_mut() {
 			let dropped = grid.push(packet, now);
 			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(dropped);
+			self.stats.pcr_position_overruns = grid.overruns();
+			self.stats.pcr_position_displacement = grid.displacement_high_water();
 			// The clock can only start once something has been placed: where the
 			// grid starts is what the wall clock is anchored to.
 			//
@@ -778,6 +825,21 @@ impl Scheduler {
 		}
 	}
 
+	/// Whether the source's PCR positions have diverged from its PCR values by
+	/// more than the buffer can absorb.
+	///
+	/// The bound is `max_latency` because that is the point at which the existing
+	/// behaviour stops being a deferral and starts being a loss: below it the
+	/// displacement is spilled packets waiting in a buffer that is allowed to be
+	/// that deep, and above it the live edge outruns the output clock, so
+	/// [`Scheduler::catch_up`] moves the clock and the skipped slots are dropped.
+	/// Always `false` under [`Clocking::Arrival`], which has no grid to displace.
+	pub fn pcr_position_diverged(&self) -> bool {
+		self.grid
+			.as_ref()
+			.is_some_and(|grid| grid.displacement_high_water() > self.max_latency_packets)
+	}
+
 	/// Current jitter-buffer occupancy in packets (the de-jitter cushion depth).
 	pub fn buffered_packets(&self) -> usize {
 		match self.grid.as_ref() {
@@ -797,6 +859,10 @@ impl Scheduler {
 			bursts: self.profile.bursts(),
 			arrival_lead_ms: self.profile.lead().as_millis().min(u128::from(u64::MAX)) as u64,
 			latency_target_ms: self.target.as_millis().min(u128::from(u64::MAX)) as u64,
+			pcr_position_displacement_ms: self
+				.packets_to_duration(self.stats.pcr_position_displacement)
+				.as_millis()
+				.min(u128::from(u64::MAX)) as u64,
 			..self.stats
 		}
 	}
@@ -1426,6 +1492,163 @@ mod tests {
 	/// The output as an ST 2022-7 receiver sees it: what byte went in which slot.
 	fn by_slot(leg: &[(Framing, Vec<u8>)]) -> Vec<(u64, Vec<u8>)> {
 		leg.iter().map(|(f, dg)| (f.slot, dg.clone())).collect()
+	}
+
+	/// A source at the mux rate whose PCR *values* are the same exact grid as
+	/// [`stream_packets`]'s, but whose PCR *positions* are clustered: `cluster`
+	/// PCR-bearing packets back-to-back, then the media bytes belonging to all the
+	/// slots that cluster just claimed, then the next cluster.
+	///
+	/// This is the measured shape of a `moq export ts` capture. In
+	/// `~/t19-pcrfix/exp-new/export.ts` — 393,311 packets, 2,473 PCRs, an exact
+	/// 25 ms value grid with 0 intervals over the 40 ms repetition limit — 87.2 %
+	/// of the PCR packets sit one packet from the previous one, and the media bytes
+	/// they label are heaped between the clusters at gaps up to 2,730 packets,
+	/// against the 165 an even grid at that rate implies. Every check on the values
+	/// passes; the positional cadence is degenerate.
+	///
+	/// At the mux rate, so `RUN_SLOTS` slots carry `RUN_SLOTS` packets and the
+	/// average rate is exactly what the grid is provisioned for. That is the point:
+	/// the defect is positional, not volumetric, and a rate check cannot see it.
+	fn stream_packets_clustered(runs: usize, cluster: usize) -> Vec<(Packet, Duration)> {
+		let mut out = Vec::new();
+		let mut run = 0;
+		while run < runs {
+			let burst = cluster.min(runs - run);
+			let at = pcr::ticks_to_duration(run as u64 * RUN_SLOTS * TICKS_PER_PACKET);
+			let mut offset = 0;
+			// The cluster: consecutive packets, one PCR each, values a full run
+			// apart. Each claims a whole interval's span and carries one packet.
+			for step in 0..burst {
+				let pcr = (run + step) as u64 * RUN_SLOTS * TICKS_PER_PACKET;
+				out.push((
+					content_packet(0x100, Some(pcr)),
+					at + Duration::from_micros(offset * 10),
+				));
+				offset += 1;
+			}
+			// The media those intervals were labelling, with no PCR among it, so it
+			// all falls in the single run the last PCR of the cluster left open.
+			for _ in 0..(burst as u64 * RUN_SLOTS) {
+				out.push((content_packet(0x100, None), at + Duration::from_micros(offset * 10)));
+				offset += 1;
+			}
+			run += burst;
+		}
+		out
+	}
+
+	/// The same volume and the same PCR values, spread evenly — the control.
+	fn stream_packets_at_rate(runs: usize) -> Vec<(Packet, Duration)> {
+		let mut out = Vec::new();
+		for run in 0..runs {
+			let pcr = run as u64 * RUN_SLOTS * TICKS_PER_PACKET;
+			let at = pcr::ticks_to_duration(pcr);
+			for index in 0..RUN_SLOTS {
+				let packet = content_packet(0x100, (index == 0).then_some(pcr));
+				out.push((packet, at + Duration::from_micros(index * 10)));
+			}
+		}
+		out
+	}
+
+	#[test]
+	fn a_clustered_pcr_position_displaces_the_grid_and_is_counted() {
+		// The assumption `close_run` makes is that packets between two PCRs are
+		// proportional to the media time between them. This source breaks it while
+		// keeping the values exact, so nothing that grades the values can object.
+		//
+		// What it must not do is pass silently. The displacement is the figure that
+		// says by how much, and it is what tells this apart from a rate peak.
+		let cfg = stream_config();
+		let clustered = stream_packets_clustered(64, 8);
+		let even = stream_packets_at_rate(64);
+
+		let t0 = Instant::now();
+		let mut bad = Scheduler::new(&cfg);
+		for (packet, at) in &clustered {
+			bad.enqueue(packet.clone(), t0 + *at);
+		}
+		let mut good = Scheduler::new(&cfg);
+		for (packet, at) in &even {
+			good.enqueue(packet.clone(), t0 + *at);
+		}
+
+		let bad = bad.stats();
+		let good = good.stats();
+
+		// The control carries the same bytes and the same PCR values at the same
+		// average rate, so anything it also reports is not the positional defect.
+		assert_eq!(
+			good.pcr_position_overruns, 0,
+			"an evenly spread source overran its own span"
+		);
+		assert_eq!(
+			good.pcr_position_displacement, 0,
+			"an evenly spread source displaced the grid by {}",
+			good.pcr_position_displacement
+		);
+
+		assert!(
+			bad.pcr_position_overruns > 0,
+			"the clustered source did not register an overrun"
+		);
+		// A cluster of 8 leaves 8 intervals' worth of media in one interval's span,
+		// so placement runs about 8 * RUN_SLOTS slots past where the source's own
+		// PCR asks the grid to be.
+		let expected = (8 * RUN_SLOTS).saturating_sub(RUN_SLOTS);
+		assert!(
+			bad.pcr_position_displacement >= expected,
+			"displacement {} did not reach the {} slots the clustering implies",
+			bad.pcr_position_displacement,
+			expected
+		);
+	}
+
+	#[test]
+	fn a_rate_peak_is_not_read_as_a_positional_defect() {
+		// The discriminator, stated as a test: an I-frame overruns its interval's
+		// span too, and that is legitimate — the excess spills into the stuffing
+		// after it and the grid recovers. So `overruns` alone cannot be the guard,
+		// and the displacement a peak reaches must stay far below what clustering
+		// reaches on the same stream.
+		let cfg = stream_config();
+		let t0 = Instant::now();
+
+		let mut peaky = Scheduler::new(&cfg);
+		for (packet, at) in &stream_packets_with_peak(64, 8, RUN_SLOTS as usize * 2) {
+			peaky.enqueue(packet.clone(), t0 + *at);
+		}
+		let mut clustered = Scheduler::new(&cfg);
+		for (packet, at) in &stream_packets_clustered(64, 8) {
+			clustered.enqueue(packet.clone(), t0 + *at);
+		}
+
+		let peaky = peaky.stats().pcr_position_displacement;
+		let clustered = clustered.stats().pcr_position_displacement;
+		assert!(
+			clustered > peaky * 2,
+			"a peak displaced {peaky} slots and clustering {clustered}: the two are not distinguishable"
+		);
+	}
+
+	#[test]
+	fn a_clustered_source_does_not_break_byte_identity() {
+		// The guard must not buy its diagnosis with the property the mode exists
+		// for. Two legs given the clustered source over independent paths still
+		// have to agree, because placement is still a function of the delivered
+		// packets alone — a displaced grid is displaced identically on both legs.
+		let cfg = stream_config();
+		let arrivals = stream_packets_clustered(64, 8);
+		let t0 = Instant::now();
+		let smooth = run_leg(&cfg, &arrivals, t0, &PUNCTUAL, 2_000);
+		let rough = run_leg(&cfg, &arrivals, t0, &JITTERY, 2_000);
+		assert!(!smooth.is_empty(), "the leg emitted nothing");
+		assert_eq!(
+			by_slot(&smooth),
+			by_slot(&rough),
+			"the path changed the output on a clustered source"
+		);
 	}
 
 	#[test]

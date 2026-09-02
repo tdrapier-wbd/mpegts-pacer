@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
-use crate::config::{Bitrate, Config, DEFAULT_AUTO_FALLBACK, Stall, StallPolicy};
+use crate::config::{Bitrate, Config, DEFAULT_AUTO_FALLBACK, PcrPositionPolicy, Stall, StallPolicy};
 use crate::error::{Error, Result};
 use crate::estimate::estimate_content_bitrate;
 use crate::observe::{Health, Observer, SourceState};
@@ -183,6 +183,19 @@ where
 					}
 				}
 				reporter.report(&mut observer, &scheduler, state, now);
+				// Checked after the report so the counters that explain the
+				// failure reach the observer before the error reaches the caller.
+				// Not gated on `closing`, unlike the stall above: a stall during
+				// the drain is the source having finished, whereas a displaced
+				// grid is a property of the bytes already delivered and does not
+				// become acceptable because the source has gone away.
+				if config.pcr_position_policy == PcrPositionPolicy::Fail && scheduler.pcr_position_diverged() {
+					let stats = scheduler.stats();
+					return Err(Error::SourcePcrPosition {
+						displacement_packets: stats.pcr_position_displacement,
+						overruns: stats.pcr_position_overruns,
+					});
+				}
 			}
 			maybe = source.recv(), if !closing => {
 				match maybe? {

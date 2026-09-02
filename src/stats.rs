@@ -110,6 +110,50 @@ pub struct Stats {
 	/// the input actually used. Sitting at the bound with `dropped_packets`
 	/// climbing means the bound is too low for the arrival pattern.
 	pub buffer_high_water: u64,
+
+	/// Source PCR intervals, under [`Clocking::Stream`](crate::Clocking), that
+	/// delivered more packets than the interval's own PCR values leave room for.
+	///
+	/// Stream clocking places a run of packets across the slot span its two
+	/// bounding PCR *values* imply, so it assumes the source's PCR *byte
+	/// positions* advance with its PCR values — that comparable spans of media
+	/// time carry comparable numbers of bytes. A source that emits exact PCR
+	/// values at clustered byte positions satisfies every check on the values and
+	/// still breaks that assumption. This counts how often.
+	///
+	/// Non-zero is normal: video is not flat, and a peak legitimately spills into
+	/// the slots after it (see
+	/// [`Stats::pcr_position_displacement`](Stats::pcr_position_displacement) for
+	/// the figure that tells a peak from a pathology).
+	pub pcr_position_overruns: u64,
+
+	/// Furthest placement ever ran past the slot the source's own PCR values
+	/// imply, in 188-byte packets — the high-water mark of
+	/// `next_free - next_pcr_slot`.
+	///
+	/// **This is the counter that distinguishes a rate peak from a positionally
+	/// clustered source, and neither `dropped_packets` nor `resyncs` can.** A peak
+	/// displaces the grid and then recovers, because the runs after it under-fill
+	/// their span and the displacement decays; so this settles at a bound. A
+	/// source whose PCR byte cadence does not track its PCR value cadence
+	/// displaces the grid a little further on every cycle and never recovers, so
+	/// this climbs without limit.
+	///
+	/// It matters because the symptom is otherwise misattributed. Displacement
+	/// past `max_latency` makes the leg's live edge outrun its own output clock,
+	/// which trips [`Stats::resyncs`](Stats::resyncs) and discards programme by
+	/// slot — and `resyncs` reads as "the configured rate is below the content
+	/// rate". For a clustered source that diagnosis is wrong: the average rate can
+	/// be exactly what the grid was provisioned for, and raising the rate does not
+	/// help, because the excess is positional rather than volumetric.
+	pub pcr_position_displacement: u64,
+
+	/// [`Stats::pcr_position_displacement`] as a duration at the mux rate — the
+	/// buffer depth a leg needs in order to absorb it.
+	///
+	/// The figure in packets cannot be read without the rate, and this is the one
+	/// an operator sets `max_latency` against.
+	pub pcr_position_displacement_ms: u64,
 }
 
 impl Stats {

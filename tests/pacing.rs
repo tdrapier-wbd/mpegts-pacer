@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mpegts_pacer::{
-	CallbackObserver, Clocking, Config, Error, Framing, Health, IterSource, Packet, PcrMode, Result, Sink, SourceState,
-	StallPolicy, TS_PACKET_SIZE, pace, pace_with,
+	CallbackObserver, Clocking, Config, Error, Framing, Health, IterSource, Packet, PcrMode, PcrPositionPolicy, Result,
+	Sink, SourceState, StallPolicy, TS_PACKET_SIZE, pace, pace_with,
 };
 
 const MUX_RATE: u64 = 10_000_000;
@@ -702,6 +702,104 @@ async fn a_stream_clocked_leg_joins_the_transport_its_partner_is_sending() {
 			None => panic!("the late leg sent sequence {sequence}, which its partner never used"),
 		}
 	}
+}
+
+/// A stream whose PCR *values* are an exact grid at the mux rate but whose PCR
+/// *positions* are clustered: `cluster` PCR-bearing packets back-to-back, then
+/// the media belonging to all the intervals that cluster just claimed.
+///
+/// The measured shape of a `moq export ts` capture, in which 87 % of PCR packets
+/// sit one packet from the previous one while the value grid is exact to the
+/// tick. Value cadence and positional cadence are separate properties of a
+/// source, and only the first is what a PCR conformance check looks at.
+fn clustered_pcr_stream(intervals: usize, cluster: usize, per_interval: usize) -> Vec<Packet> {
+	let ticks_per_packet = (TS_PACKET_SIZE as u64 * 8 * 27_000_000) / MUX_RATE;
+	let mut out = Vec::new();
+	let mut interval = 0;
+	while interval < intervals {
+		let burst = cluster.min(intervals - interval);
+		for step in 0..burst {
+			let pcr = (interval + step) as u64 * per_interval as u64 * ticks_per_packet;
+			out.push(packet(Some(pcr), (out.len() % 16) as u8));
+		}
+		for _ in 0..(burst * per_interval) {
+			out.push(packet(None, (out.len() % 16) as u8));
+		}
+		interval += burst;
+	}
+	out
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_positionally_clustered_source_is_refused_rather_than_silently_mispaced() {
+	// The input satisfies every check on its PCR values and breaks the assumption
+	// the placement rests on. Left alone the run produces output that carries a
+	// byte-locked PCR over a stream that has quietly lost content to the grid
+	// running past its own buffer — output that passes a downstream conformance
+	// check while being wrong, which is the worst of the available outcomes.
+	//
+	// The bound is the configured buffer, so the leg here is one buffered tighter
+	// than the displacement this source forces. A leg with a deep buffer absorbs
+	// it, which is the control below.
+	let input = clustered_pcr_stream(64, 8, 40);
+	let config = Config::new(MUX_RATE)
+		.with_latency(Duration::from_millis(10))
+		.with_max_latency(Duration::from_millis(25))
+		.with_clocking(Clocking::Stream)
+		.with_pcr_position_policy(PcrPositionPolicy::Fail);
+	assert!(config.validate().is_ok(), "the config itself is answerable");
+
+	let sent: Numbered = Arc::new(Mutex::new(Vec::new()));
+	let err = pace_with(
+		config,
+		IterSource::new(input.clone()),
+		FramedSink::new(sent.clone()),
+		CallbackObserver::new(|_| {}),
+	)
+	.await
+	.expect_err("a clustered source was paced as though its positions tracked its values");
+
+	match err {
+		Error::SourcePcrPosition {
+			displacement_packets,
+			overruns,
+		} => {
+			assert!(overruns > 0, "refused without having seen an overrun");
+			assert!(displacement_packets > 0, "refused without a displacement to justify it");
+		}
+		other => panic!("wrong error: {other}"),
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_same_source_is_paced_when_the_buffer_can_absorb_it() {
+	// The control, and the reason the guard is a policy against a bound rather
+	// than a rejection of the shape. The displacement is real either way and is
+	// always counted; whether it costs anything depends on whether the buffer is
+	// deeper than it. So the same input through a leg with a deep buffer must run
+	// to completion, and must still report what it saw.
+	let input = clustered_pcr_stream(64, 8, 40);
+	let config = Config::new(MUX_RATE)
+		.with_latency(Duration::from_millis(200))
+		.with_max_latency(Duration::from_millis(2_000))
+		.with_clocking(Clocking::Stream)
+		.with_pcr_position_policy(PcrPositionPolicy::Fail);
+
+	let sent: Numbered = Arc::new(Mutex::new(Vec::new()));
+	let stats = pace_with(
+		config,
+		IterSource::new(input),
+		FramedSink::new(sent.clone()),
+		CallbackObserver::new(|_| {}),
+	)
+	.await
+	.expect("a displacement inside the buffer is not a failure");
+
+	assert!(stats.output_packets > 0, "the leg emitted nothing");
+	assert!(
+		stats.pcr_position_overruns > 0,
+		"the displacement went unreported just because it was affordable"
+	);
 }
 
 // --- grooming either data plane ------------------------------------------------
