@@ -32,7 +32,7 @@
 use std::fmt::Display;
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mpegts_pacer::{
 	CallbackObserver, Clocking, Config, DEFAULT_LATENCY, DEFAULT_LATENCY_FACTOR, Health, Latency, PcrMode,
@@ -67,6 +67,10 @@ Reads a transport stream on stdin and writes it out at a constant bitrate.
   --sequence-seed N        first RTP sequence number, for a stream-clocked pair
   --require-pcr-position   fail if the source's PCR byte positions do not track
                            its PCR values by more than the buffer can absorb
+
+  --stats-interval-ms N    emit a machine-readable counter line to stderr every
+                           N ms, for a run long enough that the closing report
+                           is not enough
 
   -h, --help               print this
   -V, --version            print the version";
@@ -111,6 +115,8 @@ struct Invocation {
 	rate: String,
 	rtp: bool,
 	ssrc: Option<u32>,
+	/// How often to emit a counter line, if at all.
+	stats_interval: Option<Duration>,
 }
 
 async fn run() -> Result<(), Failure> {
@@ -151,6 +157,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	let mut clocking = Clocking::Arrival;
 	let mut sequence_seed = 0;
 	let mut pcr_position_policy = PcrPositionPolicy::default();
+	let mut stats_interval = None;
 
 	let mut at = 2;
 	while let Some(arg) = args.get(at) {
@@ -192,6 +199,14 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 			// silently started dropping. Off by default: the same behaviour
 			// absorbs a genuine rate peak, and a peak is legitimate.
 			"--require-pcr-position" => pcr_position_policy = PcrPositionPolicy::Fail,
+			// A permanent feed outlives any closing report, and the counters that
+			// matter over hours are the ones that are supposed to be *stationary*
+			// — buffer depth, recovered media rate, cushion. Emitting them on a
+			// timer is what makes those a time series rather than one reading.
+			"--stats-interval-ms" => {
+				let ms = millis(args, &mut at, "--stats-interval-ms")?;
+				stats_interval = (!ms.is_zero()).then_some(ms);
+			}
 			other => return Err(usage(format!("unknown argument {other:?}"))),
 		}
 	}
@@ -239,6 +254,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 		rate,
 		rtp,
 		ssrc,
+		stats_interval,
 	})
 }
 
@@ -267,14 +283,20 @@ async fn egress(invocation: Invocation) -> Result<Stats, Failure> {
 		dest,
 		rtp,
 		ssrc,
+		stats_interval,
 		..
 	} = invocation;
 	let source = ReadSource::new(tokio::io::stdin());
 
 	if dest == "-" || dest == "stdout" {
-		return pace_with(config, source, WriteSink::new(tokio::io::stdout()), liveness())
-			.await
-			.map_err(failed);
+		return pace_with(
+			config,
+			source,
+			WriteSink::new(tokio::io::stdout()),
+			liveness(stats_interval),
+		)
+		.await
+		.map_err(failed);
 	}
 
 	let destination: SocketAddr = dest
@@ -286,11 +308,18 @@ async fn egress(invocation: Invocation) -> Result<Stats, Failure> {
 			Some(id) => RtpSink::with_ssrc(socket, destination, id),
 			None => RtpSink::new(socket, destination),
 		};
-		pace_with(config, source, sink, liveness()).await.map_err(failed)
-	} else {
-		pace_with(config, source, UdpSink::new(socket, destination), liveness())
+		pace_with(config, source, sink, liveness(stats_interval))
 			.await
 			.map_err(failed)
+	} else {
+		pace_with(
+			config,
+			source,
+			UdpSink::new(socket, destination),
+			liveness(stats_interval),
+		)
+		.await
+		.map_err(failed)
 	}
 }
 
@@ -330,14 +359,31 @@ fn announce(invocation: &Invocation) {
 	eprintln!("mpegts-pacer: -> {target} @ {rate} b/s, {pcr}{clock}, {depth}");
 }
 
-/// Log liveness transitions to stderr.
+/// Log liveness transitions to stderr, and optionally a counter line on a timer.
 ///
-/// Without this a dead source is invisible from the outside: the egress holds its
-/// rate whether or not there is a programme in it, so an operator watching bitrate
-/// or packet arrival sees a healthy leg either way.
-fn liveness() -> CallbackObserver<impl FnMut(Health) + Send> {
+/// Without the first a dead source is invisible from the outside: the egress holds
+/// its rate whether or not there is a programme in it, so an operator watching
+/// bitrate or packet arrival sees a healthy leg either way.
+///
+/// The second exists because a feed that runs for months is not graded by the
+/// report it prints when it stops. The counters that decide whether it is *still*
+/// healthy — buffer depth against its set point, the recovered media rate, the
+/// cushion in force — are the ones that should not be moving, and a single reading
+/// cannot show that they are not.
+fn liveness(interval: Option<Duration>) -> CallbackObserver<impl FnMut(Health) + Send> {
 	let mut last: Option<SourceState> = None;
+	let started = Instant::now();
+	let mut next = interval.map(|every| (started + every, every));
 	CallbackObserver::new(move |health: Health| {
+		if let Some((due, every)) = next {
+			let now = Instant::now();
+			if now >= due {
+				// Skip whole periods rather than catching up, so a stalled
+				// emitter does not produce a burst of backdated lines.
+				next = Some((now + every, every));
+				sample(started.elapsed(), &health);
+			}
+		}
 		if last.replace(health.source) == Some(health.source) {
 			return;
 		}
@@ -356,6 +402,40 @@ fn liveness() -> CallbackObserver<impl FnMut(Health) + Send> {
 			state => eprintln!("mpegts-pacer: source {state:?}"),
 		}
 	})
+}
+
+/// One counter line, `key=value` so it can be parsed without a schema.
+///
+/// Cumulative counters and standing levels are both here on purpose: the first
+/// say what has gone wrong, the second whether it is still going wrong.
+fn sample(elapsed: Duration, health: &Health) {
+	let s = &health.stats;
+	eprintln!(
+		"mpegts-pacer: sample t={} state={:?} out={} content={} null={} stuffing={:.3} \
+		 dropped={} late_drops={} underruns={} stalls={} muted={} resyncs={} pcr_inserted={} \
+		 buffer={} buffer_high_water={} cushion_ms={} lead_ms={} media_rate_bps={} \
+		 content_gap_max_ms={} pcr_displacement={}",
+		elapsed.as_secs(),
+		health.source,
+		s.output_packets,
+		s.content_packets,
+		s.null_packets,
+		s.null_ratio(),
+		s.dropped_packets,
+		s.late_drops,
+		s.underruns,
+		s.stalls,
+		s.muted_packets,
+		s.resyncs,
+		s.pcr_inserted,
+		s.buffer_packets,
+		s.buffer_high_water,
+		s.latency_target_ms,
+		s.arrival_lead_ms,
+		s.media_rate_bps,
+		s.content_gap_max_ms,
+		s.pcr_position_displacement,
+	);
 }
 
 fn report(stats: &Stats) {

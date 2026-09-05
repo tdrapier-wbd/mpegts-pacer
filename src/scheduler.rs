@@ -949,6 +949,7 @@ impl Scheduler {
 			arrival_lead_ms: self.profile.lead().as_millis().min(u128::from(u64::MAX)) as u64,
 			latency_target_ms: self.target.as_millis().min(u128::from(u64::MAX)) as u64,
 			media_rate_bps: (self.media.rate_pps * PACKET_BITS as f64) as u64,
+			buffer_packets: self.buffered_packets() as u64,
 			pcr_position_displacement_ms: self
 				.packets_to_duration(self.stats.pcr_position_displacement)
 				.as_millis()
@@ -1452,6 +1453,56 @@ mod tests {
 			"the deferral queue drained once content ran out"
 		);
 		assert_eq!(sched.stats().content_packets, 1_001);
+	}
+
+	#[test]
+	fn a_snapshot_reports_the_standing_buffer_depth_not_its_peak() {
+		// The soak instrument. A feed that runs for months is not graded by the
+		// report it prints when it stops, and `buffer_high_water` cannot answer
+		// "is the release loop still holding its set point" because it only ever
+		// rises: an hour after one transient it still reports the transient. So
+		// the snapshot has to carry the live occupancy alongside the peak.
+		let cfg = config()
+			.with_latency(Duration::from_millis(500))
+			.with_packets_per_datagram(1);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+		for _ in 0..1_000 {
+			sched.enqueue(content_packet(0x100, None), t0);
+		}
+
+		let filled = sched.stats();
+		assert_eq!(
+			filled.buffer_packets,
+			sched.buffered_packets() as u64,
+			"the snapshot disagrees with the scheduler about what it is holding"
+		);
+		assert_eq!(
+			filled.buffer_packets, filled.buffer_high_water,
+			"nothing has drained yet"
+		);
+
+		// Drain it. The peak is a bound that must not move; the standing depth is
+		// the reading that must fall — a field wired to the high-water mark by
+		// mistake passes every assertion above and fails this one.
+		drain_saturated(&mut sched, t0 + Duration::from_millis(500), 1_200);
+		let drained = sched.stats();
+		assert_eq!(
+			drained.buffer_high_water, filled.buffer_high_water,
+			"the peak moved while the buffer was emptying"
+		);
+		assert!(
+			drained.buffer_packets < filled.buffer_packets,
+			"standing depth {} did not fall below the {} it started at",
+			drained.buffer_packets,
+			filled.buffer_packets
+		);
+		assert_eq!(
+			drained.buffer_packets,
+			sched.buffered_packets() as u64,
+			"the snapshot and the scheduler disagree after the drain"
+		);
 	}
 
 	#[test]

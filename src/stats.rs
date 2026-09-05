@@ -120,6 +120,16 @@ pub struct Stats {
 	/// climbing means the bound is too low for the arrival pattern.
 	pub buffer_high_water: u64,
 
+	/// De-jitter buffer occupancy at the moment of the snapshot, in 188-byte
+	/// packets — the standing depth rather than the peak.
+	///
+	/// The release loop settles where this equals the cushion, so sampled over a
+	/// long run it is the loop's error signal and the first place a slow drift
+	/// shows. `buffer_high_water` cannot serve: it only ever rises, so it reports
+	/// a single transient hours after the fact and says nothing about whether the
+	/// stage is still holding its set point.
+	pub buffer_packets: u64,
+
 	/// Source PCR intervals, under [`Clocking::Stream`](crate::Clocking), that
 	/// delivered more packets than the interval's own PCR values leave room for.
 	///
