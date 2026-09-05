@@ -1376,6 +1376,51 @@ mod tests {
 	}
 
 	#[test]
+	fn media_rate_survives_pcr_intervals_that_carry_almost_no_media_time() {
+		// The test above puts every PCR on an exact 25 ms grid, which is the one
+		// thing a media-aware exporter does not do. T19 measured its PCR packets
+		// arriving byte-adjacent -- pairs a tick or two apart -- among intervals of
+		// the ordinary length.
+		//
+		// A near-zero interval is degenerate for a rate estimate: it contributes
+		// packets to the numerator and almost nothing to the denominator, and
+		// because the window decays on *media* time it also decays almost nothing
+		// out. Enough of them and the sums ratchet up without bound, so the
+		// estimate ramps linearly for as long as the feed runs. Nothing in a short
+		// window shows it, and the wire stays perfectly conformant while it
+		// happens: the release loop simply empties the buffer and stuffs the
+		// difference.
+		let mut sched = Scheduler::new(&config().with_latency(Duration::from_millis(500)));
+		let t0 = Instant::now();
+		let mut ticks = 0_u64;
+		let mut packets = 0_u64;
+		let intervals = 4_000;
+		for i in 0..intervals {
+			let burst = if i % 25 == 0 { 500 } else { 4 };
+			sched.enqueue(content_packet(0x100, Some(ticks)), t0);
+			for _ in 1..burst {
+				sched.enqueue(content_packet(0x100, None), t0);
+			}
+			packets += burst;
+			// Every other PCR is byte-adjacent to the one before it: one tick of
+			// media time, not 25 ms of it.
+			ticks += if i % 2 == 0 { 1 } else { PCR_CLOCK_HZ / 40 };
+		}
+		let elapsed = ticks as f64 / PCR_CLOCK_HZ as f64;
+		let truth = packets as f64 / elapsed;
+		let estimate = sched.stats().media_rate_bps as f64 / PACKET_BITS as f64;
+		assert!(
+			estimate < truth * 2.0,
+			"estimate {estimate:.0} pps ran away from the true {truth:.0} pps \
+			 -- degenerate PCR intervals are ratcheting the window"
+		);
+		assert!(
+			estimate > truth * 0.5,
+			"estimate {estimate:.0} pps collapsed below the true {truth:.0} pps"
+		);
+	}
+
+	#[test]
 	fn pcr_reinsertion_pre_empts_a_saturated_run() {
 		// The media-aware failure mode in miniature: one PCR, then a coded frame's
 		// worth of content with no PCR in it and no slot the scheduler declines.
