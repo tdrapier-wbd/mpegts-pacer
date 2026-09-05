@@ -12,11 +12,19 @@
 //! - a **media clock** recovered from the source PCR. Content packets are
 //!   released at the source's own media rate (estimated from PCR deltas), delayed
 //!   by the configured latency, so the output preserves the source duration
-//!   instead of draining a burst faster than real time.
+//!   instead of draining a burst faster than real time. The rate is a feed-forward
+//!   term only: release is closed-loop on buffer occupancy, because a feed that
+//!   runs permanently cannot afford to integrate the error in an estimate. See
+//!   [`MediaClock::observe`] and [`MediaClock::due`].
 //!
 //! Every output slot emits a content packet when the media clock says one is due
-//! and the buffer has it, otherwise a null packet. So a burst is absorbed by the
-//! [`JitterBuffer`] and released at media rate, while the wire stays CBR.
+//! and the buffer has it, otherwise a null packet — except that a slot falling on
+//! a PCR deadline is taken for the PCR whatever else wanted it, the content it
+//! displaced waiting one slot. So a burst is absorbed by the [`JitterBuffer`] and
+//! released at media rate, the wire stays CBR, and the repetition limit is held
+//! independently of both. That last independence is the point: on a media-aware
+//! source there is no spare slot inside a burst, and a PCR that waits for one
+//! waits for the frame. See [`Scheduler::reinsert_pcr`].
 //!
 //! How much burst it can absorb is the one thing that differs by two orders of
 //! magnitude between data planes, so under [`Latency::Adaptive`] the depths are
@@ -47,14 +55,31 @@ use crate::pcr::{self, PACKET_BITS, PcrRegen};
 use crate::slot::SlotMap;
 use crate::stats::Stats;
 
-/// Smoothing factor for the media-rate EMA (weight of each new sample).
-const RATE_EMA_ALPHA: f64 = 0.1;
+/// Media-time constant of the content-rate estimator: how far back a PCR
+/// interval still carries weight.
+///
+/// Long enough to span a group of pictures at broadcast frame rates, because the
+/// estimator has to average over the *content* structure to see the content rate.
+const RATE_WINDOW: f64 = 2.0;
+
+/// How hard the release rate is trimmed to hold the buffer at the cushion: the
+/// fractional rate change applied when occupancy is a full cushion away from it.
+///
+/// Small, because this is a media clock and the trim is a deliberate slew of it.
+/// It only has to out-run the drift of a rate estimate, not chase a burst — the
+/// buffer is what absorbs bursts.
+const RATE_SERVO_GAIN: f64 = 0.05;
 
 /// Recovers the source media rate from PCR deltas and paces content release.
 #[derive(Debug)]
 struct MediaClock {
 	/// Wall time content packet 0 becomes eligible (first enqueue + latency).
 	anchor: Option<Instant>,
+	/// Wall time the release credit was last advanced.
+	ticked: Option<Instant>,
+	/// Content packets the release clock has authorised, fractional part kept so
+	/// the rate is not quantised by the slot interval.
+	credit: f64,
 	/// Content packets released so far.
 	released: u64,
 	/// Estimated content rate in packets per second.
@@ -65,21 +90,43 @@ struct MediaClock {
 	last_pcr: Option<u64>,
 	/// Packets enqueued since the last PCR (the numerator of a rate sample).
 	packets_since_pcr: u64,
+	/// Decayed packet count and decayed media seconds over [`RATE_WINDOW`]. The
+	/// rate is their *ratio*; see [`MediaClock::observe`].
+	decayed_packets: f64,
+	decayed_secs: f64,
 }
 
 impl MediaClock {
 	fn new(fallback_pps: f64) -> Self {
 		Self {
 			anchor: None,
+			ticked: None,
+			credit: 0.0,
 			released: 0,
 			rate_pps: fallback_pps,
 			estimated: false,
 			last_pcr: None,
 			packets_since_pcr: 0,
+			decayed_packets: 0.0,
+			decayed_secs: 0.0,
 		}
 	}
 
 	/// Observe an enqueued packet, refining the media-rate estimate on each PCR.
+	///
+	/// **The estimate is a ratio of sums, not a mean of ratios**, and on a
+	/// media-aware source the two are not close. Averaging the per-interval rate
+	/// `count / seconds` assumes each interval carries a comparable number of
+	/// packets; a demuxed export does not, because a PCR interval holds either a
+	/// coded frame or nothing much. Measured on a 20 s export: intervals on an
+	/// exact 25 ms grid, but 1 to 4,631 packets each with a median of 8. The
+	/// per-interval rates then have a median of 320 pps against a true rate of
+	/// 6,191, so a smoothed average of them sits far below the truth for most of
+	/// its life — 4,744 pps at the end of that clip, a 23% under-read. Release is
+	/// `rate * elapsed`, so the pacer holds media back, the buffer fills to its
+	/// bound, and it sheds the oldest programme while the wire runs a third
+	/// stuffing. Summing the packets and the media seconds separately and dividing
+	/// once is unbiased however the packets are distributed between the intervals.
 	fn observe(&mut self, packet: &Packet) {
 		self.packets_since_pcr = self.packets_since_pcr.saturating_add(1);
 		let Some(pcr) = packet.pcr() else {
@@ -91,13 +138,13 @@ impl MediaClock {
 			// Ignore zero deltas and discontinuities (loop wrap / splice); those
 			// don't reflect a real elapsed interval.
 			if delta > 0 && secs > 0.0 && pcr::ticks_to_duration(delta) <= pcr::PCR_DISCONTINUITY_GAP {
-				let sample = self.packets_since_pcr as f64 / secs;
-				self.rate_pps = if self.estimated {
-					self.rate_pps * (1.0 - RATE_EMA_ALPHA) + sample * RATE_EMA_ALPHA
-				} else {
-					sample
-				};
-				self.estimated = true;
+				let decay = (-secs / RATE_WINDOW).exp();
+				self.decayed_packets = self.decayed_packets * decay + self.packets_since_pcr as f64;
+				self.decayed_secs = self.decayed_secs * decay + secs;
+				if self.decayed_secs > 0.0 {
+					self.rate_pps = self.decayed_packets / self.decayed_secs;
+					self.estimated = true;
+				}
 			}
 		}
 		self.last_pcr = Some(pcr);
@@ -114,16 +161,46 @@ impl MediaClock {
 		self.estimated.then_some(self.rate_pps)
 	}
 
-	/// Number of content packets that should have been released by `now`.
-	fn due(&self, now: Instant) -> u64 {
+	/// Number of content packets that should have been released by `now`, holding
+	/// the buffer at `target` packets deep.
+	///
+	/// **Release is a closed loop on buffer occupancy, not an open loop on the
+	/// rate estimate**, and for a feed that runs permanently the difference is the
+	/// whole thing. Releasing at `rate * elapsed` integrates every error in `rate`:
+	/// a 2.5% under-read costs 2.5% of *uptime* in buffer depth, so occupancy and
+	/// latency climb without limit and the leg eventually sheds the oldest
+	/// programme to stay under its bound — measured on the media-aware lane as
+	/// +1.8 s of delivery latency across a 90 s window and 10,279 packets shed at
+	/// a 2.5 s bound. No rate estimator is exact enough to fix that, because
+	/// nothing bounds the integral. Correcting the release rate by the occupancy
+	/// error does bound it: the loop settles where occupancy equals the cushion,
+	/// which is by definition where the leg is releasing at the rate it is being
+	/// delivered. The estimate then only has to be close enough to keep the
+	/// correction inside its clamp.
+	fn due(&mut self, now: Instant, buffered: usize, target: f64) -> u64 {
 		let Some(anchor) = self.anchor else {
 			return 0;
 		};
 		if now < anchor {
 			return 0;
 		}
-		let elapsed = now.duration_since(anchor).as_secs_f64();
-		(elapsed * self.rate_pps) as u64 + 1
+		let last = self.ticked.unwrap_or(anchor);
+		if now > last {
+			let dt = now.duration_since(last).as_secs_f64();
+			self.ticked = Some(now);
+			self.credit += dt * self.release_rate(buffered, target);
+		}
+		self.credit as u64 + 1
+	}
+
+	/// The rate to release at now: the estimated content rate, trimmed towards
+	/// whatever would return the buffer to `target`. See [`MediaClock::due`].
+	fn release_rate(&self, buffered: usize, target: f64) -> f64 {
+		if target <= 0.0 {
+			return self.rate_pps;
+		}
+		let error = ((buffered as f64 - target) / target).clamp(-1.0, 1.0);
+		self.rate_pps * (1.0 + error * RATE_SERVO_GAIN)
 	}
 }
 
@@ -419,6 +496,9 @@ pub struct Scheduler {
 	last_pcr_index: Option<u64>,
 	/// PCR re-insertion threshold, in output packets at the mux rate.
 	pcr_max_packets: u64,
+	/// Content admitted to the output but not yet transmitted, because a slot it
+	/// would have used was taken by a re-inserted PCR. See [`Scheduler::admit`].
+	deferred: VecDeque<Packet>,
 	/// Wall time the output slot at `anchor_slot` is due (first content + latency).
 	anchor: Option<Instant>,
 	/// The output slot the wall-clock anchor refers to. Zero under
@@ -486,6 +566,7 @@ impl Scheduler {
 			// Inject with margin below the hard limit so datagram granularity and
 			// waiting for a stuffing slot can't push an interval past it.
 			pcr_max_packets: latency_to_packets(config.pcr_max_interval.mul_f64(0.75), bitrate).max(1) as u64,
+			deferred: VecDeque::new(),
 			anchor: None,
 			anchor_slot: 0,
 			slot: 0,
@@ -698,11 +779,15 @@ impl Scheduler {
 		}
 		let anchor = now + self.target;
 		self.media.anchor = Some(anchor);
+		self.media.ticked = None;
+		self.media.credit = 0.0;
 		self.media.released = 0;
 		// A rate sample taken across the gap would read as the outage length, not
 		// as a media interval; drop the pending one and re-seed on the next PCR.
 		self.media.last_pcr = None;
 		self.media.packets_since_pcr = 0;
+		self.media.decayed_packets = 0.0;
+		self.media.decayed_secs = 0.0;
 	}
 
 	/// What the input is currently doing. See [`SourceState`].
@@ -819,6 +904,9 @@ impl Scheduler {
 
 	/// Whether any content remains to be emitted.
 	pub fn has_pending(&self) -> bool {
+		if !self.deferred.is_empty() {
+			return true;
+		}
 		match self.grid.as_ref() {
 			Some(grid) => grid.has_content(),
 			None => !self.buffer.is_empty(),
@@ -842,10 +930,11 @@ impl Scheduler {
 
 	/// Current jitter-buffer occupancy in packets (the de-jitter cushion depth).
 	pub fn buffered_packets(&self) -> usize {
-		match self.grid.as_ref() {
+		let held = match self.grid.as_ref() {
 			Some(grid) => grid.placed.len() + grid.run.len(),
 			None => self.buffer.len(),
-		}
+		};
+		held + self.deferred.len()
 	}
 
 	/// A snapshot of the pacing statistics.
@@ -859,6 +948,7 @@ impl Scheduler {
 			bursts: self.profile.bursts(),
 			arrival_lead_ms: self.profile.lead().as_millis().min(u128::from(u64::MAX)) as u64,
 			latency_target_ms: self.target.as_millis().min(u128::from(u64::MAX)) as u64,
+			media_rate_bps: (self.media.rate_pps * PACKET_BITS as f64) as u64,
 			pcr_position_displacement_ms: self
 				.packets_to_duration(self.stats.pcr_position_displacement)
 				.as_millis()
@@ -873,7 +963,12 @@ impl Scheduler {
 	pub fn emit_datagram(&mut self, now: Instant) -> &[u8] {
 		self.catch_up(now);
 		self.scratch.clear();
-		let due = self.media.due(now);
+		// The cushion in *content* packets, not carrier packets: the buffer holds
+		// media, and at 11 Mb/s of carrier over 9.4 Mb/s of content the two differ
+		// by the stuffing ratio, which would leave the loop holding the buffer a
+		// sixth deeper than it was asked to.
+		let target = self.media.rate_pps * self.target.as_secs_f64();
+		let due = self.media.due(now, self.buffer.len(), target);
 		// With no content arriving there is no clock to hold: inserting PCR into a
 		// programme-free carrier is what makes a dead feed look conformant to
 		// everything downstream, so re-insertion stops with the content.
@@ -881,7 +976,15 @@ impl Scheduler {
 		for _ in 0..self.packets_per_datagram {
 			let index = self.slot;
 			let want_content = self.media.released < due;
-			if let Some(packet) = self.next_content(index, want_content) {
+			self.admit(index, want_content);
+			if let Some(pcr) = self.reinsert_pcr(index, stalled) {
+				// The PCR takes the slot whether or not content wanted it. Content
+				// it displaces waits one slot in `deferred`; see `reinsert_pcr`.
+				let packet = pcr_only_packet(self.pcr_pid.expect("pid set"), self.pcr_pid_cc, pcr);
+				self.scratch.extend_from_slice(&packet);
+				self.last_pcr_index = Some(index);
+				self.stats.pcr_inserted = self.stats.pcr_inserted.saturating_add(1);
+			} else if let Some(packet) = self.deferred.pop_front() {
 				let is_pcr = packet.has_pcr();
 				if self.pcr_pid == Some(packet.pid()) {
 					self.pcr_pid_cc = packet.as_bytes()[3] & 0x0f;
@@ -906,15 +1009,7 @@ impl Scheduler {
 				if is_pcr {
 					self.last_pcr_index = Some(index);
 				}
-				self.media.released = self.media.released.saturating_add(1);
 				self.stats.content_packets = self.stats.content_packets.saturating_add(1);
-			} else if let Some(pcr) = self.reinsert_pcr(index, stalled) {
-				// A stuffing slot doubles as a re-inserted PCR when the source's
-				// own PCR would otherwise fall past the repetition limit.
-				let packet = pcr_only_packet(self.pcr_pid.expect("pid set"), self.pcr_pid_cc, pcr);
-				self.scratch.extend_from_slice(&packet);
-				self.last_pcr_index = Some(index);
-				self.stats.pcr_inserted = self.stats.pcr_inserted.saturating_add(1);
 			} else {
 				self.scratch.extend_from_slice(&self.null);
 				self.stats.null_packets = self.stats.null_packets.saturating_add(1);
@@ -930,6 +1025,24 @@ impl Scheduler {
 			self.stats.output_packets = self.stats.output_packets.saturating_add(1);
 		}
 		&self.scratch
+	}
+
+	/// Move at most one packet from the input side into the emission queue.
+	///
+	/// Release is still governed by the clock the mode selects — the media clock
+	/// under arrival clocking, the slot map under stream clocking — so admitting
+	/// one packet per slot changes nothing about *when* content becomes eligible.
+	/// It only separates becoming eligible from being transmitted, which is what
+	/// lets a PCR take a slot without the content that wanted it being lost.
+	///
+	/// Under stream clocking the grid must be asked at every slot even while
+	/// `deferred` is occupied, because a packet whose slot passes unasked is
+	/// discarded by [`StreamGrid::take`] as late.
+	fn admit(&mut self, index: u64, want_content: bool) {
+		if let Some(packet) = self.next_content(index, want_content) {
+			self.media.released = self.media.released.saturating_add(1);
+			self.deferred.push_back(packet);
+		}
 	}
 
 	/// Move the output clock to the live edge when the leg is holding more stream
@@ -963,6 +1076,10 @@ impl Scheduler {
 		self.anchor = Some(now);
 		self.anchor_slot = target;
 		self.slot = target;
+		// Content admitted for a slot the clock has just jumped over is backlog by
+		// the same definition as the placed packets `take` will now discard.
+		self.stats.late_drops = self.stats.late_drops.saturating_add(self.deferred.len() as u64);
+		self.deferred.clear();
 		self.stats.resyncs = self.stats.resyncs.saturating_add(1);
 	}
 
@@ -988,7 +1105,19 @@ impl Scheduler {
 
 	/// The byte-locked PCR to re-insert at output `index`, or `None` when
 	/// re-insertion doesn't apply: a stalled source, preserve mode, no PCR PID
-	/// learned yet, no real PCR seen yet, or the repetition limit not yet reached.
+	/// learned yet, no real PCR seen yet, the repetition limit not yet reached, or
+	/// the packet already queued for this slot carrying a PCR of its own.
+	///
+	/// **Re-insertion pre-empts content; it does not wait for a spare slot.** The
+	/// obvious cheaper rule — insert only where the scheduler was going to stuff
+	/// anyway — holds the repetition limit on any stream that has stuffing
+	/// *distributed*, and fails on precisely the stream this pacer exists for. A
+	/// media-aware source delivers a coded frame as one burst, so its output has
+	/// ample stuffing overall and none at all inside the burst: the deadline falls
+	/// where every slot is spoken for, no spare slot appears until the burst has
+	/// drained, and the interval runs to the length of the frame. Taking the slot
+	/// costs one packet of carrier per PCR — 0.34% at a 40 ms limit and 11 Mb/s —
+	/// against an interval bounded by the frame size, which no cushion shortens.
 	fn reinsert_pcr(&self, index: u64, stalled: bool) -> Option<u64> {
 		if stalled {
 			return None;
@@ -997,6 +1126,9 @@ impl Scheduler {
 		self.pcr_pid?;
 		let last = self.last_pcr_index?;
 		if index.saturating_sub(last) < self.pcr_max_packets {
+			return None;
+		}
+		if self.deferred.front().is_some_and(Packet::has_pcr) {
 			return None;
 		}
 		match self.grid.as_ref() {
@@ -1177,6 +1309,149 @@ mod tests {
 		assert!(sched.stats().pcr_inserted > 0, "expected PCR re-insertion");
 		assert!(injected_on_pcr_pid > 0, "injected PCR must sit on the PCR PID");
 		assert!(pcr_packets > 1, "output carries more PCRs than the single source PCR");
+	}
+
+	/// The output slots of an emitted run, split into PCR positions and PIDs.
+	fn drain_saturated(sched: &mut Scheduler, from: Instant, slots: usize) -> (Vec<u64>, Vec<u16>) {
+		let mut pcr_at = Vec::new();
+		let mut pids = Vec::new();
+		// Emitting far ahead of the media clock keeps content due at every slot,
+		// which is the condition under which stuffing is unavailable.
+		let mut now = from;
+		for i in 0..slots {
+			let dg = sched.emit_datagram(now).to_vec();
+			if pcr::read_pcr(&dg).is_some() {
+				pcr_at.push(i as u64);
+			}
+			pids.push(pid_of(&dg));
+			now += Duration::from_millis(1);
+		}
+		(pcr_at, pids)
+	}
+
+	#[test]
+	fn media_rate_is_unbiased_by_clustered_pcr_intervals() {
+		// The media-aware arrival pattern: an exact PCR grid whose intervals carry
+		// wildly unequal numbers of packets. Every 25th interval is a coded frame,
+		// the rest are nearly empty; the true rate is the total over the total.
+		let mut sched = Scheduler::new(&config().with_latency(Duration::from_millis(500)));
+		let t0 = Instant::now();
+		let mut ticks = 0_u64;
+		let mut packets = 0_u64;
+		let mut seen = Vec::new();
+		let intervals = 400;
+		for i in 0..intervals {
+			let burst = if i % 25 == 0 { 500 } else { 4 };
+			sched.enqueue(content_packet(0x100, Some(ticks)), t0);
+			for _ in 1..burst {
+				sched.enqueue(content_packet(0x100, None), t0);
+			}
+			packets += burst;
+			ticks += PCR_CLOCK_HZ / 40; // a 25 ms grid
+			// Sampled only once the window has filled: the first intervals are
+			// dominated by whichever kind of interval arrived first.
+			if i as f64 * 0.025 > RATE_WINDOW {
+				seen.push(sched.stats().media_rate_bps as f64 / PACKET_BITS as f64);
+			}
+		}
+		// (500 + 24*4) / (25 * 0.025) = 954.5 packets per second.
+		let truth = packets as f64 / (intervals as f64 * 0.025);
+		// A finite window on a bursty source oscillates; what matters is that it
+		// oscillates *around* the rate rather than sitting under it, because
+		// release is `rate * elapsed` and a persistent under-read fills the buffer.
+		// The mean-of-ratios estimator this replaced returned a median near a third
+		// of the truth on the same input.
+		seen.sort_by(f64::total_cmp);
+		let median = seen[seen.len() / 2];
+		assert!(
+			median > truth * 0.85,
+			"median estimate {median:.0} pps sits below the true {truth:.0} pps"
+		);
+		assert!(
+			seen[seen.len() - 1] < truth * 1.5,
+			"peak estimate {:.0} pps overshoots the true {truth:.0} pps",
+			seen[seen.len() - 1]
+		);
+	}
+
+	#[test]
+	fn pcr_reinsertion_pre_empts_a_saturated_run() {
+		// The media-aware failure mode in miniature: one PCR, then a coded frame's
+		// worth of content with no PCR in it and no slot the scheduler declines.
+		// Opportunistic insertion has nowhere to put a PCR and the interval runs to
+		// the length of the frame.
+		let cfg = config()
+			.with_latency(Duration::from_millis(500))
+			.with_packets_per_datagram(1);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+		for _ in 0..2_000 {
+			sched.enqueue(content_packet(0x100, None), t0);
+		}
+		let (pcr_at, pids) = drain_saturated(&mut sched, t0 + Duration::from_millis(500), 2_100);
+
+		// 0.75 * 40 ms at 12 Mb/s.
+		let limit = latency_to_packets(Duration::from_millis(30), MUX_RATE) as u64;
+		let worst = pcr_at.windows(2).map(|w| w[1] - w[0]).max().expect("several PCRs");
+		assert!(
+			worst <= limit + 1,
+			"worst PCR interval {worst} packets exceeds the {limit}-packet deadline"
+		);
+		assert!(sched.stats().pcr_inserted >= 6, "expected repeated pre-emption");
+		// Pre-emption defers content, it does not discard it.
+		assert_eq!(sched.stats().content_packets, 2_001, "every content packet was emitted");
+		assert_eq!(sched.stats().dropped_packets, 0);
+		assert_eq!(sched.stats().late_drops, 0);
+		assert!(
+			pids.iter()
+				.all(|&pid| pid == 0x100 || pid == crate::null_insertion::NULL_PID),
+			"output carries only the programme PID and stuffing"
+		);
+	}
+
+	#[test]
+	fn pre_emption_yields_to_a_content_pcr_in_the_same_slot() {
+		// Content that carries its own PCR satisfies the deadline, so taking the
+		// slot for a synthetic one would emit two PCRs back to back for nothing.
+		let cfg = config()
+			.with_latency(Duration::from_millis(500))
+			.with_pcr_max_interval(Duration::from_micros(200))
+			.with_packets_per_datagram(1);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		// Every packet carries a PCR, so the deadline is met without help.
+		for i in 0..200 {
+			sched.enqueue(content_packet(0x100, Some(i * TICKS_PER_PACKET)), t0);
+		}
+		let (_, _) = drain_saturated(&mut sched, t0 + Duration::from_millis(500), 200);
+		assert_eq!(
+			sched.stats().pcr_inserted,
+			0,
+			"no synthetic PCR belongs next to a content PCR"
+		);
+		assert_eq!(sched.stats().content_packets, 200);
+	}
+
+	#[test]
+	fn deferred_content_drains_into_stuffing() {
+		// The carrier cost of pre-emption is one packet per PCR, repaid at the next
+		// slot the content clock does not want: the queue must not accumulate.
+		let cfg = config()
+			.with_latency(Duration::from_millis(500))
+			.with_packets_per_datagram(1);
+		let mut sched = Scheduler::new(&cfg);
+		let t0 = Instant::now();
+		sched.enqueue(content_packet(0x100, Some(0)), t0);
+		for _ in 0..1_000 {
+			sched.enqueue(content_packet(0x100, None), t0);
+		}
+		drain_saturated(&mut sched, t0 + Duration::from_millis(500), 1_200);
+		assert!(
+			sched.deferred.is_empty(),
+			"the deferral queue drained once content ran out"
+		);
+		assert_eq!(sched.stats().content_packets, 1_001);
 	}
 
 	#[test]

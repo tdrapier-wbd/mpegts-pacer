@@ -97,6 +97,15 @@ pub struct Stats {
 	/// what an adaptive cushion is sized from.
 	pub arrival_lead_ms: u64,
 
+	/// Content rate the pacer has recovered from the source PCR, in bits per
+	/// second, and so the rate at which it is releasing media.
+	///
+	/// Against the rate the input is actually delivering, this is the one figure
+	/// that separates a groomer shedding because the path handed it more than the
+	/// mux can carry from a groomer shedding because it mis-read the stream and is
+	/// releasing too slowly. The two look identical in `dropped_packets`.
+	pub media_rate_bps: u64,
+
 	/// De-jitter cushion currently in force, in milliseconds.
 	///
 	/// Fixed for the run under [`Latency::Fixed`](crate::Latency); under

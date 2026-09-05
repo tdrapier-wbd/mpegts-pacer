@@ -383,13 +383,14 @@ fn report(stats: &Stats) {
 	// ungroomed measurement of the same path without a second tool.
 	eprintln!(
 		"mpegts-pacer: arrival. bursts={} max_burst={} packets ({:.2} MB) lead={} ms \
-		 cushion={} ms buffer_high_water={} packets",
+		 cushion={} ms buffer_high_water={} packets media_rate={} b/s",
 		stats.bursts,
 		stats.burst_max_packets,
 		(stats.burst_max_packets * TS_PACKET_SIZE as u64) as f64 / 1_000_000.0,
 		stats.arrival_lead_ms,
 		stats.latency_target_ms,
 		stats.buffer_high_water,
+		stats.media_rate_bps,
 	);
 	// Reported separately and unconditionally, because the symptom otherwise
 	// arrives as `resyncs` above and reads as a rate set too low. A non-zero
