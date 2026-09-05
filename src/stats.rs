@@ -11,7 +11,7 @@
 /// `stalls` and `muted_packets` are the content-liveness counters: they say the
 /// source stopped delivering altogether, which no other counter here can express
 /// (an output holding its rate on pure stuffing looks identical to a healthy one).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stats {
 	/// Total 188-byte packets written to the sink (content + null).
 	pub output_packets: u64,
@@ -129,6 +129,66 @@ pub struct Stats {
 	/// a single transient hours after the fact and says nothing about whether the
 	/// stage is still holding its set point.
 	pub buffer_packets: u64,
+
+	/// Numerator of the recovered media rate: decayed packet count over the
+	/// estimator's window.
+	///
+	/// `media_rate_bps` is a *ratio*, and a ratio that has gone wrong says
+	/// nothing about which half did. The two accumulators reported separately
+	/// distinguish a numerator that grows without bound from a denominator that
+	/// vanishes, which are different defects with different fixes. In a healthy
+	/// steady state this sits near `rate_pps * RATE_WINDOW`.
+	pub rate_decayed_packets: f64,
+
+	/// Denominator of the recovered media rate: decayed media seconds over the
+	/// estimator's window. See `rate_decayed_packets`.
+	///
+	/// This one has a known correct value to check against rather than merely a
+	/// plausible range: the window is an exponential decay with a fixed time
+	/// constant, so whatever the input does, a converged denominator sits close
+	/// to that constant. A denominator far below it means intervals are being
+	/// admitted whose durations do not sum to real elapsed media time.
+	pub rate_decayed_secs: f64,
+
+	/// Source PCR intervals admitted to the rate estimate.
+	///
+	/// With the two accumulators this gives the mean admitted interval, and
+	/// against the count of PCRs *seen* it says how many were rejected as
+	/// zero-delta or discontinuous. An estimator fed one interval in a thousand
+	/// is not smoothing, it is sampling.
+	pub rate_intervals: u64,
+
+	/// Source PCR-bearing packets seen by the rate estimator, admitted or not.
+	pub rate_pcrs_seen: u64,
+
+	/// Largest packet count attributed to any single admitted PCR interval.
+	///
+	/// The estimator sums packets and media seconds separately and divides
+	/// once, which is unbiased *provided each interval's packet count belongs
+	/// to that interval's media span*. Where it does not — a long run of
+	/// packets carrying no PCR, closed by one PCR a short media step later —
+	/// the pair lands in the sum as a large numerator against a small
+	/// denominator. The mean interval stays normal, so only this maximum shows
+	/// it.
+	pub rate_max_packets_in_interval: u64,
+
+	/// Admitted PCR intervals too short to serve as a rate sample on their own.
+	pub rate_sub_ms_intervals: u64,
+
+	/// The source's clock has stopped advancing usefully: programme keeps
+	/// arriving while its PCR does not move.
+	///
+	/// This is a *source* fault the groomer can see and the wire cannot, which
+	/// is the whole reason it is a counter. The groomer restamps PCR at the mux
+	/// rate, so its output stays conformant — correct continuity, correct
+	/// repetition, exact CBR — while its input has no usable timebase at all.
+	/// Measured on the media-aware lane: the exporter's PCR degenerated into a
+	/// one-tick-per-packet counter and every downstream check stayed green.
+	pub rate_clock_stalled: bool,
+
+	/// Packets held back from the rate estimate waiting for a source interval
+	/// long enough to serve as a sample. Climbing means `rate_clock_stalled`.
+	pub rate_pending_packets: u64,
 
 	/// Source PCR intervals, under [`Clocking::Stream`](crate::Clocking), that
 	/// delivered more packets than the interval's own PCR values leave room for.

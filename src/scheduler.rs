@@ -62,6 +62,16 @@ use crate::stats::Stats;
 /// estimator has to average over the *content* structure to see the content rate.
 const RATE_WINDOW: f64 = 2.0;
 
+/// Shortest span of source media time that counts as a rate sample.
+///
+/// Below this an interval carries too little media time to say anything about
+/// rate, and — because the window decays on media time — also too little to
+/// decay anything out of it. Folding such intervals in individually is what
+/// lets a source whose clock has stopped ratchet the estimate without bound.
+/// Ten milliseconds is well under the 40 ms a conformant source must repeat
+/// PCR within, so a working clock always clears it.
+const MIN_RATE_SAMPLE: f64 = 0.010;
+
 /// How hard the release rate is trimmed to hold the buffer at the cushion: the
 /// fractional rate change applied when occupancy is a full cushion away from it.
 ///
@@ -94,6 +104,31 @@ struct MediaClock {
 	/// rate is their *ratio*; see [`MediaClock::observe`].
 	decayed_packets: f64,
 	decayed_secs: f64,
+	/// PCR intervals admitted to the estimate, and PCR-bearing packets seen.
+	/// Their difference is the rejection count, which is the first thing to
+	/// check when the ratio above stops making sense.
+	intervals: u64,
+	pcrs_seen: u64,
+	/// Largest packet count ever attributed to a single admitted interval, and
+	/// the number of admitted intervals shorter than a millisecond. The mean
+	/// interval can look entirely normal while the decayed sum is dominated by
+	/// a handful of intervals that pair a huge count with almost no media time,
+	/// and only the tail shows that.
+	max_packets_in_interval: u64,
+	sub_ms_intervals: u64,
+	/// Packets and media seconds waiting for a sample long enough to be one.
+	/// See [`MediaClock::observe`].
+	pending_packets: u64,
+	pending_secs: f64,
+	/// Whether the source clock has stopped advancing usefully.
+	stalled_clock: bool,
+	/// Pending packets past which a clock is judged stopped rather than slow,
+	/// derived from the configured mux rate so it is a duration and not a
+	/// packet count that means different things at different bitrates.
+	stall_clock_packets: u64,
+	/// The carrier's own packet rate — the ceiling on any credible recovered
+	/// content rate, since the content is carried inside it.
+	carrier_pps: f64,
 }
 
 impl MediaClock {
@@ -109,6 +144,17 @@ impl MediaClock {
 			packets_since_pcr: 0,
 			decayed_packets: 0.0,
 			decayed_secs: 0.0,
+			intervals: 0,
+			pcrs_seen: 0,
+			max_packets_in_interval: 0,
+			sub_ms_intervals: 0,
+			pending_packets: 0,
+			pending_secs: 0.0,
+			stalled_clock: false,
+			// A second of carriage. A working clock closes a sample every
+			// MIN_RATE_SAMPLE, so reaching this means it has missed ~100 of them.
+			stall_clock_packets: fallback_pps.max(1.0) as u64,
+			carrier_pps: fallback_pps,
 		}
 	}
 
@@ -132,18 +178,70 @@ impl MediaClock {
 		let Some(pcr) = packet.pcr() else {
 			return;
 		};
+		self.pcrs_seen = self.pcrs_seen.saturating_add(1);
 		if let Some(last) = self.last_pcr {
 			let delta = pcr::forward_delta(last, pcr);
 			let secs = pcr::ticks_to_duration(delta).as_secs_f64();
 			// Ignore zero deltas and discontinuities (loop wrap / splice); those
 			// don't reflect a real elapsed interval.
 			if delta > 0 && secs > 0.0 && pcr::ticks_to_duration(delta) <= pcr::PCR_DISCONTINUITY_GAP {
-				let decay = (-secs / RATE_WINDOW).exp();
-				self.decayed_packets = self.decayed_packets * decay + self.packets_since_pcr as f64;
-				self.decayed_secs = self.decayed_secs * decay + secs;
-				if self.decayed_secs > 0.0 {
-					self.rate_pps = self.decayed_packets / self.decayed_secs;
-					self.estimated = true;
+				if secs < MIN_RATE_SAMPLE {
+					self.sub_ms_intervals = self.sub_ms_intervals.saturating_add(1);
+				}
+				// Coalesce until the pending sample carries enough media time to be
+				// one. A media-aware exporter emits PCR byte-adjacent, so most
+				// intervals are a tick or two long, and folding each in separately
+				// is what breaks the window: the decay is `exp(-secs/RATE_WINDOW)`,
+				// so an interval carrying no media time removes nothing while still
+				// adding its packets. Fed a source whose clock has stopped, every
+				// interval is that interval, and the numerator becomes an undecayed
+				// running total against a frozen denominator — a ratio that ramps
+				// linearly at the packet rate, without bound, for as long as the
+				// feed runs.
+				//
+				// Accumulating instead keeps each packet with the media time it
+				// actually arrived in, which is the property the ratio-of-sums
+				// exists to preserve, and guarantees every decay is driven by a
+				// real span. If the clock has genuinely stopped the sample never
+				// completes, and holding the last credible rate is the correct
+				// answer: the alternative is releasing at a rate the carrier
+				// cannot hold and draining the cushion to nothing.
+				self.pending_packets = self.pending_packets.saturating_add(self.packets_since_pcr);
+				self.pending_secs += secs;
+				if self.pending_secs >= MIN_RATE_SAMPLE {
+					let decay = (-self.pending_secs / RATE_WINDOW).exp();
+					self.decayed_packets = self.decayed_packets * decay + self.pending_packets as f64;
+					self.decayed_secs = self.decayed_secs * decay + self.pending_secs;
+					self.intervals = self.intervals.saturating_add(1);
+					self.max_packets_in_interval = self.max_packets_in_interval.max(self.pending_packets);
+					self.pending_packets = 0;
+					self.pending_secs = 0.0;
+					if self.decayed_secs > 0.0 {
+						let candidate = self.decayed_packets / self.decayed_secs;
+						// A content rate above the carrier's is not a content rate.
+						// The groomer emits this stream at the mux rate, stuffing
+						// included, so over a window of seconds the media inside it
+						// cannot arrive faster than the carrier can hold — measured
+						// over one interval it certainly can, which is what the
+						// buffer is for, but not over the window. When the sums say
+						// otherwise the packets are real and the media time is not,
+						// and the last credible rate is a better estimate than a
+						// derived one known to be impossible. Releasing on the
+						// derived one is what drained the cushion to nothing.
+						if candidate <= self.carrier_pps {
+							self.rate_pps = candidate;
+							self.estimated = true;
+							self.stalled_clock = false;
+						} else {
+							self.stalled_clock = true;
+						}
+					}
+				} else if self.pending_packets > self.stall_clock_packets {
+					// Enough programme has gone by that a working clock would have
+					// closed the sample many times over. Nothing downstream can see
+					// this — the groomer restamps PCR, so the wire stays conformant
+					// while its input has no usable timebase at all.
+					self.stalled_clock = true;
 				}
 			}
 		}
@@ -788,6 +886,9 @@ impl Scheduler {
 		self.media.packets_since_pcr = 0;
 		self.media.decayed_packets = 0.0;
 		self.media.decayed_secs = 0.0;
+		self.media.pending_packets = 0;
+		self.media.pending_secs = 0.0;
+		self.media.stalled_clock = false;
 	}
 
 	/// What the input is currently doing. See [`SourceState`].
@@ -950,6 +1051,14 @@ impl Scheduler {
 			latency_target_ms: self.target.as_millis().min(u128::from(u64::MAX)) as u64,
 			media_rate_bps: (self.media.rate_pps * PACKET_BITS as f64) as u64,
 			buffer_packets: self.buffered_packets() as u64,
+			rate_decayed_packets: self.media.decayed_packets,
+			rate_decayed_secs: self.media.decayed_secs,
+			rate_intervals: self.media.intervals,
+			rate_pcrs_seen: self.media.pcrs_seen,
+			rate_max_packets_in_interval: self.media.max_packets_in_interval,
+			rate_sub_ms_intervals: self.media.sub_ms_intervals,
+			rate_clock_stalled: self.media.stalled_clock,
+			rate_pending_packets: self.media.pending_packets,
 			pcr_position_displacement_ms: self
 				.packets_to_duration(self.stats.pcr_position_displacement)
 				.as_millis()
@@ -1421,6 +1530,69 @@ mod tests {
 	}
 
 	#[test]
+	fn media_rate_holds_when_the_source_clock_stops_advancing() {
+		// Measured on the media-aware lane, and it is not a hypothetical: about
+		// ten minutes into a run the exporter's PCR stopped being a clock and
+		// became a counter, advancing by exactly one 90 kHz tick per PCR packet
+		// and never recovering. 100,000 packets -- 26 seconds of programme --
+		// arrived carrying 6.9 ms of PCR.
+		//
+		// Fed that, an estimator that believes its input is arithmetically right
+		// and useless: the packets are real, the media time is not, and their
+		// ratio is a rate two orders of magnitude above anything the carrier
+		// could hold. It then ramps linearly for as long as the feed runs,
+		// because a one-tick interval also decays nothing out of the window.
+		//
+		// The pacer cannot fix the source, but it must not integrate the lie. A
+		// sample too short to carry usable media time is not a sample; the
+		// packets wait for one that is. Under a stopped clock that never comes,
+		// which is exactly right -- the last credible rate is the best estimate
+		// available, and holding it keeps the cushion instead of draining it.
+		let mut sched = Scheduler::new(&config().with_latency(Duration::from_millis(500)));
+		let t0 = Instant::now();
+		let mut ticks = 0_u64;
+
+		// Ten seconds of a healthy 25 ms grid to establish the truth.
+		let healthy_intervals = 400;
+		let per_interval = 160;
+		for _ in 0..healthy_intervals {
+			sched.enqueue(content_packet(0x100, Some(ticks)), t0);
+			for _ in 1..per_interval {
+				sched.enqueue(content_packet(0x100, None), t0);
+			}
+			ticks += PCR_CLOCK_HZ / 40;
+		}
+		let truth = per_interval as f64 / 0.025;
+		let settled = sched.stats().media_rate_bps as f64 / PACKET_BITS as f64;
+		assert!(
+			settled > truth * 0.8 && settled < truth * 1.25,
+			"the healthy arm should recover {truth:.0} pps, got {settled:.0}"
+		);
+
+		// Now the clock stops: one 90 kHz tick per PCR packet, same packet rate.
+		// This is the captured failure exactly.
+		for _ in 0..20_000 {
+			sched.enqueue(content_packet(0x100, Some(ticks)), t0);
+			for _ in 1..per_interval {
+				sched.enqueue(content_packet(0x100, None), t0);
+			}
+			ticks += PCR_CLOCK_HZ / 90_000;
+		}
+
+		let estimate = sched.stats().media_rate_bps as f64 / PACKET_BITS as f64;
+		assert!(
+			estimate < truth * 2.0,
+			"estimate ran to {estimate:.0} pps against a true {truth:.0} pps: a stopped \
+			 source clock is being integrated as though it were media time"
+		);
+		assert!(
+			sched.stats().rate_clock_stalled,
+			"a source clock that has stopped advancing must be visible in the counters, \
+			 because nothing on the wire shows it"
+		);
+	}
+
+	#[test]
 	fn pcr_reinsertion_pre_empts_a_saturated_run() {
 		// The media-aware failure mode in miniature: one PCR, then a coded frame's
 		// worth of content with no PCR in it and no slot the scheduler declines.
@@ -1653,19 +1825,25 @@ mod tests {
 
 	#[test]
 	fn resume_re_anchors_the_media_clock() {
-		// Two PCRs 1 ms apart carrying one packet each => ~1000 pps media rate.
+		// Eleven PCRs 1 ms apart carrying one packet each => 10 packets across
+		// 10 ms, a ~1000 pps media rate. A single 1 ms interval used to be enough
+		// to set the estimate; it no longer is, because an interval that short
+		// cannot decay anything out of the window and a source emitting nothing
+		// else has no usable timebase. Ten of them make one sample, and the rate
+		// they imply is the same one this test has always been about.
 		let cfg = config()
 			.with_latency(Duration::from_millis(20))
 			.with_stall_timeout(Some(Duration::from_millis(200)))
 			.with_packets_per_datagram(1);
 		let mut sched = Scheduler::new(&cfg);
 		let t0 = Instant::now();
-		sched.enqueue(content_packet(0x100, Some(0)), t0);
-		sched.enqueue(content_packet(0x100, Some(27_000)), t0);
+		for i in 0..11 {
+			sched.enqueue(content_packet(0x100, Some(i * 27_000)), t0);
+		}
 
 		// Release the cushion, then run past the stall timeout with no new input.
 		let mut now = t0 + Duration::from_millis(20);
-		for _ in 0..4 {
+		for _ in 0..13 {
 			sched.emit_datagram(now);
 			now += Duration::from_millis(1);
 		}

@@ -414,7 +414,8 @@ fn sample(elapsed: Duration, health: &Health) {
 		"mpegts-pacer: sample t={} state={:?} out={} content={} null={} stuffing={:.3} \
 		 dropped={} late_drops={} underruns={} stalls={} muted={} resyncs={} pcr_inserted={} \
 		 buffer={} buffer_high_water={} cushion_ms={} lead_ms={} media_rate_bps={} \
-		 content_gap_max_ms={} pcr_displacement={}",
+		 content_gap_max_ms={} pcr_displacement={} rate_dpkts={:.1} rate_dsecs={:.6} \
+		 rate_intervals={} rate_pcrs={} pcr_rebases={} rate_max_pkts={} rate_subms={} clock_stalled={} rate_pending={}",
 		elapsed.as_secs(),
 		health.source,
 		s.output_packets,
@@ -435,6 +436,15 @@ fn sample(elapsed: Duration, health: &Health) {
 		s.media_rate_bps,
 		s.content_gap_max_ms,
 		s.pcr_position_displacement,
+		s.rate_decayed_packets,
+		s.rate_decayed_secs,
+		s.rate_intervals,
+		s.rate_pcrs_seen,
+		s.pcr_rebases,
+		s.rate_max_packets_in_interval,
+		s.rate_sub_ms_intervals,
+		s.rate_clock_stalled,
+		s.rate_pending_packets,
 	);
 }
 
