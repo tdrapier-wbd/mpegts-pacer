@@ -355,6 +355,17 @@ late it was, reintroducing exactly the per-process variation the mode removes. A
 climbing count means the release latency is short for the path's jitter -- and
 the partner leg, which got the packet in time, covers for it.
 
+A leg sends a datagram only when it knows what its partner sends in those slots,
+because an ST 2022-7 receiver keeps whichever datagram arrives first, and a guess
+replaces programme under the same sequence number. So it stays silent, counting
+the slots in `withheld_packets`, past the last PCR it has received, across any
+stretch of the stream it missed (a PCR interval twice the longest of the last
+eight, or a jump its own silence explains), and until a content PCR has gone out
+in its own slot since either, which is when its re-insertion state is the
+stream's again. A run whose closing PCR it never received, including the last one
+when its source ends, is discarded and counted in `cut_runs_packets` rather than
+spread across slots it can only guess.
+
 ### The positional assumption, and the guard on it
 
 Stream clocking reads one PCR interval as *both* a duration and a length: the
@@ -425,7 +436,9 @@ receiver, an ST 2022-7 pair, an FEC path) without touching the engine.
 
 `output_packets`, `content_packets`, `null_packets`, `dropped_packets` (buffer at
 `max_latency`), `late_drops` (packets that missed their slot under
-`Clocking::Stream`), `input_nulls_stripped` (source padding replaced by our own),
+`Clocking::Stream`), `withheld_packets` and `cut_runs_packets` (slots a
+stream-clocked leg could not know and did not send, and the packets it could not
+place), `input_nulls_stripped` (source padding replaced by our own),
 `underruns` (buffer starved while the input was still live), `pcr_rebases` (source
 discontinuities), `pcr_inserted` (byte-locked PCR-only packets added to hold the
 repetition limit), `stalls` (times the input went away), `muted_packets` (output

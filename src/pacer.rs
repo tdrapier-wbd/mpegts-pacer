@@ -178,8 +178,12 @@ where
 						if let Some(framing) = scheduler.framing() {
 							sink.set_framing(framing);
 						}
+						// Empty when a stream-clocked leg cannot know what its
+						// partner sends in these slots: silence is the safe output.
 						let datagram = scheduler.emit_datagram(now);
-						sink.send(datagram).await?;
+						if !datagram.is_empty() {
+							sink.send(datagram).await?;
+						}
 					}
 				}
 				reporter.report(&mut observer, &scheduler, state, now);

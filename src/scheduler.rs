@@ -80,6 +80,16 @@ const MIN_RATE_SAMPLE: f64 = 0.010;
 /// buffer is what absorbs bursts.
 const RATE_SERVO_GAIN: f64 = 0.05;
 
+/// Closed PCR intervals remembered for [`StreamGrid::missed_pcrs`]: enough to
+/// span the irregular cadence a muxer that only stamps video packets produces.
+const RECENT_SPANS: usize = 8;
+
+/// How many times the longest recent PCR interval an interval must reach before
+/// it counts as spanning PCRs the leg did not receive. Two, because a leg that
+/// misses one PCR of a regular source sees an interval twice the source's own.
+/// On an irregular cadence a single missed PCR can stay under it.
+const MISSED_PCR_FACTOR: u64 = 2;
+
 /// Recovers the source media rate from PCR deltas and paces content release.
 #[derive(Debug)]
 struct MediaClock {
@@ -316,9 +326,24 @@ impl MediaClock {
 /// than carried forward, so a leg returning from an outage with a backlog behind
 /// it rejoins at the current position instead of replaying what its partner has
 /// already delivered.
+///
+/// A run whose closing PCR the leg never received cannot be placed: spreading it
+/// across the span to the next PCR it did receive would put programme in slots
+/// its partner fills with what ran in between. Such a run is discarded, and the
+/// slots it and the missing stretch would have occupied are not *determined*
+/// (see [`StreamGrid::determined`]).
 #[derive(Debug)]
 struct StreamGrid {
 	map: SlotMap,
+	/// The first slot of the stretch of stream this leg has received unbroken:
+	/// the slot of the first PCR after the start, or after the last stretch the
+	/// leg missed.
+	known_from: Option<u64>,
+	/// Spans of the most recent closed runs, in slots, against which a PCR
+	/// interval long enough to mean missing PCRs is recognised.
+	recent_spans: VecDeque<u64>,
+	/// Packets discarded with runs that had no closing PCR to place them by.
+	cut: u64,
 	/// The run being accumulated: its opening PCR packet, then the rest.
 	run: Vec<Packet>,
 	/// `(source PCR, absolute slot)` of the packet that opened the run.
@@ -333,9 +358,6 @@ struct StreamGrid {
 	/// PCR wrap or a source discontinuity. Signed, because a splice can move the
 	/// source clock either way.
 	epoch: i128,
-	/// Slots spanned by the previous run, used to place a trailing run at the
-	/// same spacing when the source ends mid-run.
-	last_span: Option<(u64, usize)>,
 	/// The lowest slot still free. A PCR interval carrying more packets than the
 	/// mux rate has room for spills into the slots after it rather than losing
 	/// the excess; see [`StreamGrid::close_run`].
@@ -352,12 +374,14 @@ impl StreamGrid {
 	fn new(mux_rate_bps: u64, capacity: usize) -> Self {
 		Self {
 			map: SlotMap::new(mux_rate_bps),
+			known_from: None,
+			recent_spans: VecDeque::with_capacity(RECENT_SPANS),
+			cut: 0,
 			run: Vec::new(),
 			open: None,
 			open_at: None,
 			placed: VecDeque::new(),
 			epoch: 0,
-			last_span: None,
 			next_free: 0,
 			overruns: 0,
 			displacement_high_water: 0,
@@ -431,11 +455,20 @@ impl StreamGrid {
 			.open_at
 			.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
 		let (slot, after_silence) = self.slot_for(pcr, since);
-		// Content from before the silence belongs where it was going, not smeared
-		// across the gap: spreading it would drop fresh packets into slots the
-		// partner leg is filling with the programme that ran while we were away.
-		let dropped = if after_silence {
-			self.flush()
+		let missed = self
+			.open
+			.is_some_and(|(_, open_slot)| self.missed_pcrs(slot.saturating_sub(open_slot)));
+		let dropped = if self.open.is_none() {
+			self.known_from = Some(slot);
+			0
+		} else if after_silence || missed {
+			// The open run's closing PCR is somewhere in what this leg missed.
+			// Placed at a guessed spacing, its packets would land in slots the
+			// partner fills with the programme that ran in between.
+			self.cut = self.cut.saturating_add(self.run.len() as u64);
+			self.run.clear();
+			self.known_from = Some(slot);
+			0
 		} else {
 			self.close_run(slot)
 		};
@@ -484,7 +517,10 @@ impl StreamGrid {
 			return 0;
 		}
 		let span = next_slot.saturating_sub(open_slot);
-		self.last_span = Some((span, count));
+		if self.recent_spans.len() == RECENT_SPANS {
+			self.recent_spans.pop_front();
+		}
+		self.recent_spans.push_back(span);
 		if count as u64 > span {
 			self.overruns = self.overruns.saturating_add(1);
 		}
@@ -507,6 +543,33 @@ impl StreamGrid {
 		dropped
 	}
 
+	/// Whether a PCR interval of `span` slots is too long to be one the source
+	/// sent, and so spans PCRs this leg did not receive.
+	///
+	/// Judged against the source's own recent cadence rather than the standard's
+	/// 100 ms ceiling, because a source that spaces its PCRs further apart than
+	/// that is not missing them. Before any interval has been seen nothing can be
+	/// judged, so nothing is.
+	fn missed_pcrs(&self, span: u64) -> bool {
+		self.recent_spans
+			.iter()
+			.max()
+			.is_some_and(|&longest| longest > 0 && span >= longest.saturating_mul(MISSED_PCR_FACTOR))
+	}
+
+	/// Whether every slot in `from..to` holds what the stream put there, as far as
+	/// this leg can know: inside the stretch it has received unbroken, and before
+	/// the run still waiting for its closing PCR.
+	///
+	/// Outside that window a slot's content depends on stream this leg has not
+	/// seen. Its partner may have seen it, so the slot is not this leg's to fill.
+	fn determined(&self, from: u64, to: u64) -> bool {
+		match (self.known_from, self.open) {
+			(Some(known_from), Some((_, open_slot))) => known_from <= from && to <= open_slot,
+			_ => false,
+		}
+	}
+
 	/// How far placement has run past the source's own PCR grid, at its worst.
 	fn displacement_high_water(&self) -> u64 {
 		self.displacement_high_water
@@ -517,16 +580,14 @@ impl StreamGrid {
 		self.overruns
 	}
 
-	/// Place a run left open by the end of the source, at the previous run's
-	/// spacing. Without this the last PCR interval of every stream is discarded.
-	fn flush(&mut self) -> u64 {
-		let Some((_, open_slot)) = self.open else {
-			return 0;
-		};
-		let (span, count) = self.last_span.unwrap_or((self.run.len() as u64, self.run.len().max(1)));
-		let scaled = span.saturating_mul(self.run.len() as u64) / count.max(1) as u64;
-		let end = open_slot.saturating_add(scaled.max(self.run.len() as u64));
-		self.close_run(end)
+	/// Discard a run left open by the end of the source.
+	///
+	/// Its closing PCR is not coming, so its slots could only be guessed, and a
+	/// partner whose source carries on places the same packets by the PCR this
+	/// leg never saw. The cost is the last PCR interval of a stream that ends.
+	fn flush(&mut self) {
+		self.cut = self.cut.saturating_add(self.run.len() as u64);
+		self.run.clear();
 	}
 
 	/// The packet due at `slot`, discarding any whose slot has already passed.
@@ -609,6 +670,17 @@ pub struct Scheduler {
 	/// Slot placement, present under [`Clocking::Stream`] only — its presence is
 	/// what selects the mode everywhere below.
 	grid: Option<StreamGrid>,
+	/// Under [`Clocking::Stream`], whether this leg's emission state — the last
+	/// PCR's slot, the PCR PID's continuity counter, content waiting behind a
+	/// re-inserted PCR — is the stream's rather than its own history's.
+	///
+	/// Those are functions of what was emitted, so a leg that has passed over
+	/// slots it could not fill holds values its partner does not, and would
+	/// re-insert a PCR where the partner sends programme. Cleared whenever the leg
+	/// passes such a slot or jumps its clock; set again when a content PCR goes
+	/// out in its own slot with nothing queued ahead of it, which leaves both legs
+	/// in the same state.
+	phased: bool,
 	/// Release latency and its hard upper bound, in output packets: the depth the
 	/// leg aims to hold, and the depth past which it is behind the stream rather
 	/// than buffering it.
@@ -669,6 +741,7 @@ impl Scheduler {
 			anchor_slot: 0,
 			slot: 0,
 			grid: (config.clocking == Clocking::Stream).then(|| StreamGrid::new(bitrate, capacity)),
+			phased: false,
 			latency_packets: latency_to_packets(target, bitrate) as u64,
 			max_latency_packets: capacity as u64,
 			sequence_seed: config.sequence_seed,
@@ -733,7 +806,7 @@ impl Scheduler {
 			// bytes, packed differently, which merges no better than different
 			// bytes do. Rounding down to a boundary costs a few slots of leading
 			// stuffing and makes the packing a property of the stream.
-			if self.stats.output_packets == 0
+			if self.stats.output_packets + self.stats.withheld_packets == 0
 				&& let (Some(first), Some(edge)) = (grid.first_slot(), grid.last_slot())
 			{
 				let per_datagram = self.packets_per_datagram as u64;
@@ -846,12 +919,12 @@ impl Scheduler {
 		}
 	}
 
-	/// Place any packets held back waiting for a closing PCR, because the source
-	/// has ended and none is coming. A no-op outside [`Clocking::Stream`].
+	/// Give up on packets held back waiting for a closing PCR, because the source
+	/// has ended and none is coming. A no-op outside [`Clocking::Stream`]; see
+	/// [`StreamGrid::flush`].
 	pub fn flush(&mut self) {
 		if let Some(grid) = self.grid.as_mut() {
-			let dropped = grid.flush();
-			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(dropped);
+			grid.flush();
 		}
 	}
 
@@ -865,15 +938,18 @@ impl Scheduler {
 	/// the discontinuity indicator is for.
 	fn resume(&mut self, now: Instant) {
 		self.stalled = false;
-		if let Some(regen) = self.pcr_regen.as_mut() {
-			regen.flag_discontinuity();
-		}
 		// Under stream clocking there is no arrival-derived state to restore: the
 		// returning content carries the slots it belongs in, which is the whole
 		// point — a leg that has been silent for ten seconds resumes on the grid
-		// its partner has been using throughout.
+		// its partner has been using throughout. Nor is there a discontinuity to
+		// flag: the emitted PCR is the slot, so the resumed content's timestamps
+		// sit where they always did against it, and a flag the partner does not
+		// set would be a byte difference under the same sequence number.
 		if self.grid.is_some() {
 			return;
+		}
+		if let Some(regen) = self.pcr_regen.as_mut() {
+			regen.flag_discontinuity();
 		}
 		let anchor = now + self.target;
 		self.media.anchor = Some(anchor);
@@ -949,6 +1025,7 @@ impl Scheduler {
 		self.observe_state(now);
 		let packets = self.packets_per_datagram as u64;
 		self.slot = self.slot.saturating_add(packets);
+		self.phased = false;
 		self.stats.muted_packets = self.stats.muted_packets.saturating_add(packets);
 	}
 
@@ -1059,6 +1136,7 @@ impl Scheduler {
 			rate_sub_ms_intervals: self.media.sub_ms_intervals,
 			rate_clock_stalled: self.media.stalled_clock,
 			rate_pending_packets: self.media.pending_packets,
+			cut_runs_packets: self.grid.as_ref().map_or(0, |grid| grid.cut),
 			pcr_position_displacement_ms: self
 				.packets_to_duration(self.stats.pcr_position_displacement)
 				.as_millis()
@@ -1070,6 +1148,10 @@ impl Scheduler {
 	/// Emit one output datagram (`packets_per_datagram` transport packets) at
 	/// `now`, advancing the byte clock. Returns a borrow of the internal scratch
 	/// buffer, valid until the next call. Never allocates after construction.
+	///
+	/// Under [`Clocking::Stream`] the borrow is empty when the leg cannot know
+	/// what its partner sends in these slots, and the caller sends nothing; the
+	/// byte clock advances all the same. See [`Stats::withheld_packets`].
 	pub fn emit_datagram(&mut self, now: Instant) -> &[u8] {
 		self.catch_up(now);
 		self.scratch.clear();
@@ -1083,19 +1165,36 @@ impl Scheduler {
 		// programme-free carrier is what makes a dead feed look conformant to
 		// everything downstream, so re-insertion stops with the content.
 		let stalled = self.observe_state(now).is_stalled();
+		let packets = self.packets_per_datagram as u64;
+		let determined = self
+			.grid
+			.as_ref()
+			.map(|grid| !stalled && grid.determined(self.slot, self.slot.saturating_add(packets)));
+		if determined == Some(false) {
+			self.phased = false;
+		}
+		// Phase is judged as the datagram opens: re-insertion before a phasing
+		// PCR in the same datagram was decided on this leg's history, not the
+		// stream's.
+		let send = determined.is_none_or(|determined| determined && self.phased);
 		for _ in 0..self.packets_per_datagram {
 			let index = self.slot;
 			let want_content = self.media.released < due;
-			self.admit(index, want_content);
+			let admitted = self.admit(index, want_content);
 			if let Some(pcr) = self.reinsert_pcr(index, stalled) {
 				// The PCR takes the slot whether or not content wanted it. Content
 				// it displaces waits one slot in `deferred`; see `reinsert_pcr`.
 				let packet = pcr_only_packet(self.pcr_pid.expect("pid set"), self.pcr_pid_cc, pcr);
 				self.scratch.extend_from_slice(&packet);
 				self.last_pcr_index = Some(index);
-				self.stats.pcr_inserted = self.stats.pcr_inserted.saturating_add(1);
+				if send {
+					self.stats.pcr_inserted = self.stats.pcr_inserted.saturating_add(1);
+				}
 			} else if let Some(packet) = self.deferred.pop_front() {
 				let is_pcr = packet.has_pcr();
+				if is_pcr && admitted && self.deferred.is_empty() && determined == Some(true) {
+					self.phased = true;
+				}
 				if self.pcr_pid == Some(packet.pid()) {
 					self.pcr_pid_cc = packet.as_bytes()[3] & 0x0f;
 				}
@@ -1119,20 +1218,30 @@ impl Scheduler {
 				if is_pcr {
 					self.last_pcr_index = Some(index);
 				}
-				self.stats.content_packets = self.stats.content_packets.saturating_add(1);
+				if send {
+					self.stats.content_packets = self.stats.content_packets.saturating_add(1);
+				}
 			} else {
 				self.scratch.extend_from_slice(&self.null);
-				self.stats.null_packets = self.stats.null_packets.saturating_add(1);
+				if send {
+					self.stats.null_packets = self.stats.null_packets.saturating_add(1);
+				}
 				// A null while content was due but unavailable is a genuine
 				// underrun (input starved); a null while holding the cushion is
 				// ordinary rate stuffing. A stalled source is neither: it is
 				// counted as a stall, so it can't hide inside the underrun figure.
-				if want_content && !stalled {
+				if send && want_content && !stalled {
 					self.stats.underruns = self.stats.underruns.saturating_add(1);
 				}
 			}
 			self.slot = self.slot.saturating_add(1);
-			self.stats.output_packets = self.stats.output_packets.saturating_add(1);
+			if send {
+				self.stats.output_packets = self.stats.output_packets.saturating_add(1);
+			}
+		}
+		if !send {
+			self.scratch.clear();
+			self.stats.withheld_packets = self.stats.withheld_packets.saturating_add(packets);
 		}
 		&self.scratch
 	}
@@ -1148,11 +1257,13 @@ impl Scheduler {
 	/// Under stream clocking the grid must be asked at every slot even while
 	/// `deferred` is occupied, because a packet whose slot passes unasked is
 	/// discarded by [`StreamGrid::take`] as late.
-	fn admit(&mut self, index: u64, want_content: bool) {
-		if let Some(packet) = self.next_content(index, want_content) {
-			self.media.released = self.media.released.saturating_add(1);
-			self.deferred.push_back(packet);
-		}
+	fn admit(&mut self, index: u64, want_content: bool) -> bool {
+		let Some(packet) = self.next_content(index, want_content) else {
+			return false;
+		};
+		self.media.released = self.media.released.saturating_add(1);
+		self.deferred.push_back(packet);
+		true
 	}
 
 	/// Move the output clock to the live edge when the leg is holding more stream
@@ -1190,6 +1301,7 @@ impl Scheduler {
 		// the same definition as the placed packets `take` will now discard.
 		self.stats.late_drops = self.stats.late_drops.saturating_add(self.deferred.len() as u64);
 		self.deferred.clear();
+		self.phased = false;
 		self.stats.resyncs = self.stats.resyncs.saturating_add(1);
 	}
 
@@ -1229,7 +1341,9 @@ impl Scheduler {
 	/// costs one packet of carrier per PCR — 0.34% at a 40 ms limit and 11 Mb/s —
 	/// against an interval bounded by the frame size, which no cushion shortens.
 	fn reinsert_pcr(&self, index: u64, stalled: bool) -> Option<u64> {
-		if stalled {
+		// Out of phase, the interval since the last PCR is this leg's history, so
+		// a PCR inserted on it would fall where the partner's does not.
+		if stalled || (self.grid.is_some() && !self.phased) {
 			return None;
 		}
 		let regen = self.pcr_regen.as_ref()?;
@@ -1998,6 +2112,7 @@ mod tests {
 		let mut sched = Scheduler::new(config);
 		let mut out = Vec::new();
 		let mut next = 0;
+		let mut ended = false;
 		loop {
 			while next < arrivals.len() {
 				let (packet, at) = &arrivals[next];
@@ -2007,6 +2122,11 @@ mod tests {
 				}
 				sched.enqueue(packet.clone(), at);
 				next += 1;
+			}
+			// The source has ended, as the driver tells the scheduler.
+			if next == arrivals.len() && !ended {
+				sched.flush();
+				ended = true;
 			}
 			let Some(due) = sched.next_due() else {
 				break;
@@ -2033,7 +2153,11 @@ mod tests {
 				sched.advance_muted(woke);
 				continue;
 			}
-			out.push((framing, sched.emit_datagram(woke).to_vec()));
+			// A withheld datagram is not sent, exactly as in the driver.
+			let datagram = sched.emit_datagram(woke);
+			if !datagram.is_empty() {
+				out.push((framing, datagram.to_vec()));
+			}
 		}
 		out
 	}
@@ -2226,6 +2350,90 @@ mod tests {
 		let smooth = run_leg(&cfg, &arrivals, t0, &PUNCTUAL, 2_000);
 		let rough = run_leg(&cfg, &arrivals, t0, &JITTERY, 2_000);
 		assert_ne!(by_slot(&smooth), by_slot(&rough));
+	}
+
+	/// `stream` with each packet's index written into its payload, so a packet
+	/// carried in the wrong slot reads as a different datagram.
+	fn tagged(stream: Vec<(Packet, Duration)>) -> Vec<(Packet, Duration)> {
+		stream
+			.into_iter()
+			.enumerate()
+			.map(|(index, (packet, at))| {
+				let mut bytes = packet.as_bytes().to_vec();
+				bytes[TS_PACKET_SIZE - 8..].copy_from_slice(&(index as u64).to_be_bytes());
+				(Packet::from_slice(&bytes).unwrap(), at)
+			})
+			.collect()
+	}
+
+	/// Fails if `leg` sent a datagram that differs from `partner`'s in the same
+	/// slot. A slot only one of them sent is no contradiction: an ST 2022-7
+	/// receiver takes it from whichever leg has it.
+	fn assert_never_contradicts(leg: &[(Framing, Vec<u8>)], partner: &[(Framing, Vec<u8>)]) {
+		let partner: std::collections::HashMap<u64, &Vec<u8>> = partner
+			.iter()
+			.map(|(framing, datagram)| (framing.slot, datagram))
+			.collect();
+		for (framing, datagram) in leg {
+			if let Some(theirs) = partner.get(&framing.slot) {
+				assert!(
+					*theirs == datagram,
+					"slot {}: the legs sent different datagrams under one sequence number",
+					framing.slot
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn a_leg_that_misses_part_of_the_stream_never_contradicts_its_partner() {
+		// T12's opaque-lane cells: one leg loses its path and comes back. Whatever
+		// it sends has to be what its partner sends under the same sequence
+		// number, because a receiver keeps whichever arrives first. Two lengths:
+		// one inside the 5 s a PCR jump may span before it reads as a splice, and
+		// one past it.
+		let cfg = stream_config()
+			.with_packets_per_datagram(7)
+			.with_stall_timeout(Some(Duration::from_millis(200)));
+		for (from, to, runs) in [(100, 140, 400), (100, 1_300, 1_600)] {
+			let whole = tagged(stream_packets(runs));
+			let gapped: Vec<_> = whole
+				.iter()
+				.enumerate()
+				.filter(|(index, _)| !(from * RUN_LEN..to * RUN_LEN).contains(index))
+				.map(|(_, arrival)| arrival.clone())
+				.collect();
+			let t0 = Instant::now();
+			let until = (runs as u64 - 20) * RUN_SLOTS;
+			let partner = run_leg(&cfg, &whole, t0, &PUNCTUAL, until);
+			let leg = run_leg(&cfg, &gapped, t0, &JITTERY, until);
+			assert_never_contradicts(&leg, &partner);
+			let back = leg
+				.iter()
+				.filter(|(framing, _)| framing.slot > (to as u64 + 5) * RUN_SLOTS)
+				.count();
+			assert!(back > 0, "the leg never came back after missing runs {from}..{to}");
+		}
+	}
+
+	#[test]
+	fn a_leg_whose_source_ends_mid_run_never_contradicts_its_partner() {
+		// T12's cell 3: one leg's input ends and the other's carries on. The run
+		// left open has no closing PCR, so wherever the ending leg put it, it
+		// would be guessing, and so would any stuffing it sent in its place.
+		let cfg = stream_config().with_packets_per_datagram(7);
+		let whole = tagged(stream_packets(400));
+		let t0 = Instant::now();
+		let partner = run_leg(&cfg, &whole, t0, &PUNCTUAL, 380 * RUN_SLOTS);
+		let leg = run_leg(
+			&cfg,
+			&whole[..200 * RUN_LEN + RUN_LEN / 2],
+			t0,
+			&JITTERY,
+			380 * RUN_SLOTS,
+		);
+		assert!(!leg.is_empty(), "the leg emitted nothing");
+		assert_never_contradicts(&leg, &partner);
 	}
 
 	#[test]

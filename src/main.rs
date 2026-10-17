@@ -415,7 +415,8 @@ fn sample(elapsed: Duration, health: &Health) {
 		 dropped={} late_drops={} underruns={} stalls={} muted={} resyncs={} pcr_inserted={} \
 		 buffer={} buffer_high_water={} cushion_ms={} lead_ms={} media_rate_bps={} \
 		 content_gap_max_ms={} pcr_displacement={} rate_dpkts={:.1} rate_dsecs={:.6} \
-		 rate_intervals={} rate_pcrs={} pcr_rebases={} rate_max_pkts={} rate_subms={} clock_stalled={} rate_pending={}",
+		 rate_intervals={} rate_pcrs={} pcr_rebases={} rate_max_pkts={} rate_subms={} clock_stalled={} rate_pending={} \
+		 withheld={} cut_runs={}",
 		elapsed.as_secs(),
 		health.source,
 		s.output_packets,
@@ -445,6 +446,8 @@ fn sample(elapsed: Duration, health: &Health) {
 		s.rate_sub_ms_intervals,
 		s.rate_clock_stalled,
 		s.rate_pending_packets,
+		s.withheld_packets,
+		s.cut_runs_packets,
 	);
 }
 
@@ -452,7 +455,7 @@ fn report(stats: &Stats) {
 	eprintln!(
 		"mpegts-pacer: done. output_packets={} content={} null={} ({:.1}% stuffing) \
 		 pcr_inserted={} stripped_nulls={} dropped={} late_drops={} resyncs={} start_backlog={} underruns={} \
-		 stalls={} muted={} max_content_gap={} ms",
+		 withheld={} cut_runs={} stalls={} muted={} max_content_gap={} ms",
 		stats.output_packets,
 		stats.content_packets,
 		stats.null_packets,
@@ -464,6 +467,8 @@ fn report(stats: &Stats) {
 		stats.resyncs,
 		stats.start_backlog,
 		stats.underruns,
+		stats.withheld_packets,
+		stats.cut_runs_packets,
 		stats.stalls,
 		stats.muted_packets,
 		stats.content_gap_max_ms,

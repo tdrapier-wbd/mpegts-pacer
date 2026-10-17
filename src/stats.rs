@@ -55,6 +55,20 @@ pub struct Stats {
 	/// diverged: both legs drop by slot, so a leg that receives the packet in time
 	/// simply covers for one that did not.
 	pub late_drops: u64,
+	/// Output slots computed but not sent under [`Clocking::Stream`](crate::Clocking),
+	/// because this leg could not know what its partner sends there: a slot in a
+	/// stretch of the stream the leg did not receive, past the last PCR it has
+	/// seen, or before the leg is back in phase after either. The output byte clock
+	/// still advanced across them.
+	///
+	/// Silence is the one safe output for such a slot: an ST 2022-7 receiver
+	/// keeps whichever leg's datagram arrives first, so a datagram this leg
+	/// guessed would replace programme its partner sent under the same number.
+	pub withheld_packets: u64,
+	/// Input packets discarded under [`Clocking::Stream`](crate::Clocking) because
+	/// the PCR interval they belonged to was cut off: the leg missed its closing
+	/// PCR, so their slots could only be guessed.
+	pub cut_runs_packets: u64,
 	/// Times the output clock was moved to the live edge under
 	/// [`Clocking::Stream`](crate::Clocking) because the leg was holding more
 	/// stream than `max_latency`.
