@@ -993,8 +993,7 @@ impl Scheduler {
 	}
 
 	/// Give up on packets held back waiting for a closing PCR, because the source
-	/// has ended and none is coming. A no-op outside [`Clocking::Stream`]; see
-	/// [`StreamGrid::flush`].
+	/// has ended and none is coming. A no-op outside [`Clocking::Stream`].
 	pub fn flush(&mut self) {
 		if let Some(grid) = self.grid.as_mut() {
 			grid.flush();
