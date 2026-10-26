@@ -528,7 +528,7 @@ Arguments (`mpegts-pacer --help`):
 mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
              [--segment-ms N] [--latency-ms N] [--max-latency-ms N] [--latency-ceiling-ms N]
              [--ssrc N] [--stall-ms N] [--stall-grace-ms N] [--on-stall mute|continue|fail]
-             [--stream-clock] [--sequence-seed N] [--require-pcr-position]
+             [--stream-clock] [--sequence-seed N] [--align-ms N] [--require-pcr-position]
 ```
 
 - `<-|stdout|dest_ip:port>` -- `-` or `stdout` to write raw TS to a pipe, or a
@@ -558,6 +558,13 @@ mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
   Requires an explicit bitrate and an explicit `--latency-ms` or `--segment-ms`.
 - `--sequence-seed N` -- RTP sequence offset (default 0), identical on both legs
   of a pair.
+- `--align-ms N` -- with `--stream-clock`, watch the input for N ms before
+  starting, and tie the output clock to the content that arrived soonest after
+  its stream position rather than to the first content. On a segmented input a
+  leg's phase is otherwise the age of whatever it first held, a different draw
+  for every leg; aligned, two legs of one stream start within the difference of
+  their paths' fastest deliveries. Output starts N ms later; `align_gain_us`
+  reports how much faster a later delivery was than the one the leg started on.
 - `--require-pcr-position` -- refuse a source whose PCR byte positions do not
   track its PCR values by more than the buffer can absorb, instead of pacing it
   and reporting the divergence at the end (see

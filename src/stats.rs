@@ -85,6 +85,15 @@ pub struct Stats {
 	/// that joined one already running says the relay served it from well behind
 	/// the live edge, which is where its phase relative to a partner comes from.
 	pub start_backlog: u64,
+	/// Under [`Config::align`](crate::Config::align), how much sooner after its
+	/// stream position any content arrived once the leg had started than the
+	/// content it started on, in microseconds.
+	///
+	/// The error of the leg's phase, one-sided: zero when the watch caught the
+	/// fastest delivery the run ever saw. Two aligned legs differ in phase by
+	/// about the difference between their figures plus that between their paths'
+	/// fastest deliveries.
+	pub align_gain_us: u64,
 
 	/// Largest burst the input delivered, in 188-byte packets, grouping arrivals
 	/// separated by more than [`BURST_SEPARATION`](crate::BURST_SEPARATION).

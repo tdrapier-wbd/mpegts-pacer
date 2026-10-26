@@ -758,6 +758,11 @@ pub struct Scheduler {
 	max_latency_packets: u64,
 	/// Added to the slot-derived RTP sequence number.
 	sequence_seed: u16,
+	/// How long to watch the input before starting, under [`Config::align`].
+	align: Option<Duration>,
+	/// The arrival and slot of the placed content that came soonest after its
+	/// stream position, which an aligned leg ties its clock to.
+	soonest: Option<(Instant, u64)>,
 	/// When input silence stops being jitter and becomes a dead source.
 	stall: Stall,
 	/// Wall time content first arrived, which is where the start deadline runs
@@ -815,6 +820,8 @@ impl Scheduler {
 			latency_packets: latency_to_packets(target, bitrate) as u64,
 			max_latency_packets: capacity as u64,
 			sequence_seed: config.sequence_seed,
+			align: config.align.filter(|_| config.clocking == Clocking::Stream),
+			soonest: None,
 			stall: config.stall,
 			first_content_at: None,
 			last_content_at: None,
@@ -882,12 +889,23 @@ impl Scheduler {
 			if self.stats.output_packets + self.stats.withheld_packets == 0
 				&& let (Some(first), Some(edge)) = (grid.first_slot(), grid.last_slot())
 			{
-				let per_datagram = self.packets_per_datagram as u64;
-				let start = edge.saturating_sub(self.latency_packets).max(first);
-				self.anchor = Some(self.anchor.unwrap_or(now + self.target));
-				self.anchor_slot = start - (start % per_datagram);
-				self.slot = self.anchor_slot;
 				self.stats.start_backlog = edge - first;
+				match self.align {
+					Some(window) => self.align_start(first, edge, now, window),
+					None => {
+						let per_datagram = self.packets_per_datagram as u64;
+						let start = edge.saturating_sub(self.latency_packets).max(first);
+						self.anchor = Some(self.anchor.unwrap_or(now + self.target));
+						self.anchor_slot = start - (start % per_datagram);
+						self.slot = self.anchor_slot;
+					}
+				}
+			} else if self.align.is_some()
+				&& let Some(edge) = grid.last_slot()
+				&& let Some(gain) = self.arrived_sooner(edge, now)
+			{
+				let gain = gain.as_micros().min(u128::from(u64::MAX)) as u64;
+				self.stats.align_gain_us = self.stats.align_gain_us.max(gain);
 			}
 			self.note_depth();
 			return;
@@ -899,6 +917,54 @@ impl Scheduler {
 		}
 		self.note_depth();
 		self.arm(now);
+	}
+
+	/// Watch for the content that arrives soonest after its stream position, and
+	/// once `window` has passed since the first, start the clock on it: the slot
+	/// it occupies goes out a release latency after it arrived, and every other
+	/// slot in proportion. See [`Config::align`].
+	///
+	/// Revisited, like the unaligned start, until the first datagram goes out.
+	fn align_start(&mut self, first: u64, edge: u64, now: Instant, window: Duration) {
+		if self.soonest.is_none() || self.arrived_sooner(edge, now).is_some() {
+			self.soonest = Some((now, edge));
+		}
+		let watched = self
+			.first_content_at
+			.is_some_and(|at| now.saturating_duration_since(at) >= window);
+		let Some((arrived, reference)) = self.soonest.filter(|_| watched) else {
+			return;
+		};
+		let release = arrived + self.target;
+		let packets = |span: Duration| latency_to_packets(span, self.mux_rate_bps) as u64;
+		let due = if now >= release {
+			reference.saturating_add(packets(now - release))
+		} else {
+			reference.saturating_sub(packets(release - now))
+		};
+		let per_datagram = self.packets_per_datagram as u64;
+		let start = due.max(first);
+		let start = start - (start % per_datagram);
+		let anchor = if start >= reference {
+			release + self.packets_to_duration(start - reference)
+		} else {
+			release
+				.checked_sub(self.packets_to_duration(reference - start))
+				.unwrap_or(now)
+		};
+		self.anchor = Some(anchor);
+		self.anchor_slot = start;
+		self.slot = start;
+	}
+
+	/// How much sooner after its stream position the content at `slot` arrived,
+	/// at `now`, than the content an aligned leg is tied to; `None` if not sooner.
+	fn arrived_sooner(&self, slot: u64, now: Instant) -> Option<Duration> {
+		let (arrived, reference) = self.soonest?;
+		let ahead = self.packets_to_duration(slot.checked_sub(reference)?);
+		ahead
+			.checked_sub(now.saturating_duration_since(arrived))
+			.filter(|gain| !gain.is_zero())
 	}
 
 	/// Record how deep the buffer got, so the bound can be judged against use.
@@ -944,7 +1010,8 @@ impl Scheduler {
 	/// exactly as it did before any of this existed. The deadline covers the
 	/// input that fits neither description.
 	fn arm(&mut self, now: Instant) {
-		if self.anchor.is_some() {
+		// An aligned leg's clock is started by what it has watched, never by a timer.
+		if self.anchor.is_some() || self.align.is_some() {
 			return;
 		}
 		let anchor = match self.latency.start_deadline() {
@@ -2354,6 +2421,87 @@ mod tests {
 			.collect();
 		let (stats, _) = drive_leg(&cfg, &gapped);
 		assert!(stats.cut_runs_packets > 0, "a run spanning missing stream was kept");
+	}
+
+	/// [`stream_packets`] as a segmented receiver hands it over, from segment
+	/// `from` on: whole segments of `per_segment` runs, each delivered at once
+	/// when its last packet is `lag(segment)` old.
+	fn segmented(runs: usize, per_segment: usize, from: usize, lag: fn(usize) -> u64) -> Vec<(Packet, Duration)> {
+		stream_packets(runs)
+			.chunks(per_segment * RUN_LEN)
+			.enumerate()
+			.skip(from)
+			.flat_map(|(segment, packets)| {
+				let at = packets.last().expect("a segment has packets").1 + Duration::from_millis(lag(segment));
+				packets
+					.iter()
+					.enumerate()
+					.map(move |(index, (packet, _))| (packet.clone(), at + Duration::from_micros(index as u64)))
+			})
+			.collect()
+	}
+
+	/// Drive one stream-clocked leg over all of `arrivals`, and return its phase —
+	/// when, relative to `t0`, it emits slot zero, read off its first datagram — and
+	/// its counters.
+	fn phase_of(cfg: &Config, arrivals: &[(Packet, Duration)], t0: Instant) -> (f64, Stats) {
+		let mut sched = Scheduler::new(cfg);
+		let mut phase = None;
+		let packet_secs = (TS_PACKET_SIZE * 8) as f64 / MUX_RATE as f64;
+		let mut next = 0;
+		while next < arrivals.len() {
+			let (packet, at) = &arrivals[next];
+			if sched.next_due().is_none_or(|due| t0 + *at <= due) {
+				sched.enqueue(packet.clone(), t0 + *at);
+				next += 1;
+				continue;
+			}
+			let due = sched.next_due().expect("checked above");
+			let slot = sched.framing().expect("stream-clocked").slot;
+			phase.get_or_insert((due - t0).as_secs_f64() - slot as f64 * packet_secs);
+			sched.emit_datagram(due);
+		}
+		(phase.expect("the leg never sent"), sched.stats())
+	}
+
+	#[test]
+	fn aligned_legs_that_join_apart_start_in_phase() {
+		// Two receivers of one segmented stream, joining seven segments apart. Each
+		// segment reaches each of them when the playlist's cache and the poll happen
+		// to line up, anywhere from 50 ms to 1.4 s after its last packet, and the
+		// two see different draws — the first segment one leg took was 1.4 s old,
+		// the other's 50 ms. Both have, within their first ten, seen a segment at
+		// the path's fastest. Segments arrive in order, as a receiver fetches them.
+		let lag_a: fn(usize) -> u64 = |segment| match segment {
+			23 => 0,
+			s => [1_400, 900, 400, 50, 1_100][s % 5],
+		};
+		let lag_b: fn(usize) -> u64 = |segment| [400, 50, 900][segment % 3];
+		let leg_a = segmented(6_000, 200, 0, lag_a);
+		let leg_b = segmented(6_000, 200, 7, lag_b);
+		let t0 = Instant::now();
+		let base = stream_config()
+			.with_latency(Duration::from_secs(3))
+			.with_max_latency(Duration::from_secs(6));
+
+		// Started on its first content, each leg's phase is the age of the newest
+		// content it held when its clock started: here 1.39 s and 1.05 s.
+		let (a, _) = phase_of(&base, &leg_a, t0);
+		let (b, _) = phase_of(&base, &leg_b, t0);
+		assert!((a - b).abs() > 0.25, "unaligned legs started in phase: {a} against {b}");
+
+		// Watching first, both tie their clocks to the path's fastest delivery.
+		let aligned = base.with_align(Duration::from_secs(10));
+		let (a, stats_a) = phase_of(&aligned, &leg_a, t0);
+		let (b, stats_b) = phase_of(&aligned, &leg_b, t0);
+		assert!((a - b).abs() < 0.002, "aligned legs out of phase: {a} against {b}");
+		// Leg A met a faster delivery after it had started, and says by how much.
+		assert!(
+			(45_000..55_000).contains(&stats_a.align_gain_us),
+			"{}",
+			stats_a.align_gain_us
+		);
+		assert_eq!(stats_b.align_gain_us, 0);
 	}
 
 	/// The same volume and the same PCR values, spread evenly — the control.

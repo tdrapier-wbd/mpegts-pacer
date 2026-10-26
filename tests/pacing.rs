@@ -1015,6 +1015,21 @@ async fn a_cushion_deeper_than_the_buffer_is_refused() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn alignment_is_refused_without_a_stream_position_to_align() {
+	// Arrival clocking has no slot that means the same on two legs, so there is
+	// nothing for the watch to tie the clock to.
+	let config = Config::new(MUX_RATE)
+		.with_latency(Duration::from_secs(1))
+		.with_align(Duration::from_secs(10));
+	assert!(
+		config.validate().is_err(),
+		"alignment under arrival clocking must be rejected"
+	);
+	let streamed = config.with_clocking(Clocking::Stream);
+	streamed.validate().expect("a stream-clocked leg may align");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_source_that_ends_before_it_primes_is_still_paced_out() {
 	// An adaptive start holds output back until it holds a cushion. A short input
 	// never gets there, and discarding it for being short would be worse than any

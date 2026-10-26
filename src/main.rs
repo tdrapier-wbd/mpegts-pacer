@@ -65,6 +65,8 @@ Reads a transport stream on stdin and writes it out at a constant bitrate.
 
   --stream-clock           place packets by stream position, for an ST 2022-7 pair
   --sequence-seed N        first RTP sequence number, for a stream-clocked pair
+  --align-ms N             watch the input N ms before starting a stream-clocked
+                           leg, and start in phase with its fastest delivery
   --require-pcr-position   fail if the source's PCR byte positions do not track
                            its PCR values by more than the buffer can absorb
 
@@ -156,6 +158,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	let mut stall_policy = None;
 	let mut clocking = Clocking::Arrival;
 	let mut sequence_seed = 0;
+	let mut align = None;
 	let mut pcr_position_policy = PcrPositionPolicy::default();
 	let mut stats_interval = None;
 
@@ -194,6 +197,10 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 			// and an explicit latency.
 			"--stream-clock" => clocking = Clocking::Stream,
 			"--sequence-seed" => sequence_seed = number(args, &mut at, "--sequence-seed")?,
+			// A leg started on its first content inherits how stale that content
+			// was; one that watches first starts on the path's fastest delivery,
+			// which its partner sees too.
+			"--align-ms" => align = Some(millis(args, &mut at, "--align-ms")?),
 			// Refuse a source whose PCR positions do not track its PCR values,
 			// rather than emitting a byte-locked clock over a stream the grid has
 			// silently started dropping. Off by default: the same behaviour
@@ -228,6 +235,9 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	// latency or cap after it refines what it chose rather than being overwritten.
 	if let Some(segment) = segment {
 		config = config.with_segment_duration(segment);
+	}
+	if let Some(window) = align {
+		config = config.with_align(window);
 	}
 	if let Some(ceiling) = ceiling {
 		config = config.with_adaptive_latency(DEFAULT_LATENCY, ceiling, DEFAULT_LATENCY_FACTOR);
@@ -337,9 +347,10 @@ fn announce(invocation: &Invocation) {
 	} else {
 		"preserve PCR"
 	};
-	let clock = match config.clocking {
-		Clocking::Stream => ", stream-clocked",
-		Clocking::Arrival => "",
+	let clock = match (config.clocking, config.align) {
+		(Clocking::Stream, Some(window)) => format!(", stream-clocked, aligned over {} ms", window.as_millis()),
+		(Clocking::Stream, None) => ", stream-clocked".to_string(),
+		(Clocking::Arrival, _) => String::new(),
 	};
 	let depth = match config.latency {
 		Latency::Fixed { target, max } => {
@@ -416,7 +427,7 @@ fn sample(elapsed: Duration, health: &Health) {
 		 buffer={} buffer_high_water={} cushion_ms={} lead_ms={} media_rate_bps={} \
 		 content_gap_max_ms={} pcr_displacement={} rate_dpkts={:.1} rate_dsecs={:.6} \
 		 rate_intervals={} rate_pcrs={} pcr_rebases={} rate_max_pkts={} rate_subms={} clock_stalled={} rate_pending={} \
-		 withheld={} cut_runs={}",
+		 withheld={} cut_runs={} align_gain_us={}",
 		elapsed.as_secs(),
 		health.source,
 		s.output_packets,
@@ -448,6 +459,7 @@ fn sample(elapsed: Duration, health: &Health) {
 		s.rate_pending_packets,
 		s.withheld_packets,
 		s.cut_runs_packets,
+		s.align_gain_us,
 	);
 }
 
@@ -455,7 +467,7 @@ fn report(stats: &Stats) {
 	eprintln!(
 		"mpegts-pacer: done. output_packets={} content={} null={} ({:.1}% stuffing) \
 		 pcr_inserted={} stripped_nulls={} dropped={} late_drops={} resyncs={} start_backlog={} underruns={} \
-		 withheld={} cut_runs={} stalls={} muted={} max_content_gap={} ms",
+		 withheld={} cut_runs={} stalls={} muted={} max_content_gap={} ms align_gain_us={}",
 		stats.output_packets,
 		stats.content_packets,
 		stats.null_packets,
@@ -472,6 +484,7 @@ fn report(stats: &Stats) {
 		stats.stalls,
 		stats.muted_packets,
 		stats.content_gap_max_ms,
+		stats.align_gain_us,
 	);
 	// The arrival shape the run actually saw, in the same terms an external
 	// cadence instrument reports it, so a groomed leg can be compared with the

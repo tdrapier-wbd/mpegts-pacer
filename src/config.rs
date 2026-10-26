@@ -301,6 +301,21 @@ pub struct Config {
 	/// What to do when the source's PCR byte positions do not advance with its
 	/// PCR values, under [`Clocking::Stream`]. See [`PcrPositionPolicy`].
 	pub pcr_position_policy: PcrPositionPolicy,
+
+	/// Under [`Clocking::Stream`], how long to watch the input before starting,
+	/// or `None` to start on the first content as before.
+	///
+	/// A stream-clocked leg's phase is fixed by when it starts: the slot it is
+	/// emitting at that moment and the wall clock are tied from then on. Started
+	/// on the first content, it inherits however stale that content happened to
+	/// be, which on a segmented input is where in the playlist's cycle the
+	/// receiver first looked — up to a segment and a cache lifetime, a different
+	/// draw for every leg. Watching first, a leg instead ties the clock to the
+	/// content that arrived soonest after its stream position, plus the release
+	/// latency. That is a property of the path's fastest delivery rather than of
+	/// the moment the leg joined, so two legs of one stream that have each seen
+	/// such a delivery start in phase, wherever and whenever they started.
+	pub align: Option<Duration>,
 }
 
 /// Default packets per output datagram: 7 * 188 = 1316 bytes.
@@ -439,6 +454,7 @@ impl Config {
 			clocking: Clocking::default(),
 			sequence_seed: 0,
 			pcr_position_policy: PcrPositionPolicy::default(),
+			align: None,
 		}
 	}
 
@@ -562,6 +578,13 @@ impl Config {
 		self
 	}
 
+	/// Watch the input for `window` before starting, and start in phase with the
+	/// path's fastest delivery. See [`Config::align`].
+	pub fn with_align(mut self, window: Duration) -> Self {
+		self.align = Some(window);
+		self
+	}
+
 	/// Reject combinations that cannot deliver what the mode promises.
 	///
 	/// [`Clocking::Stream`] exists so that two independent pacers agree; a rate
@@ -575,6 +598,11 @@ impl Config {
 			return Err(Error::Config(
 				"latency exceeds max_latency: the priming cushion is deeper than the buffer is \
 				 allowed to be, so the input would be dropped to make room for itself",
+			));
+		}
+		if self.align.is_some() && self.clocking != Clocking::Stream {
+			return Err(Error::Config(
+				"alignment ties the output clock to stream position, which only stream clocking has",
 			));
 		}
 		if self.clocking != Clocking::Stream {
