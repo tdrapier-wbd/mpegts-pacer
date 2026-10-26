@@ -379,6 +379,8 @@ struct StreamGrid {
 	next_free: u64,
 	/// Runs that carried more packets than their own PCR span had slots for.
 	overruns: u64,
+	/// Times the grid was re-based because the source clock moved.
+	rebases: u64,
 	/// How far `next_free` ran past the slot the next source PCR asks for, at its
 	/// worst. See [`Stats::pcr_position_displacement`].
 	displacement_high_water: u64,
@@ -401,6 +403,7 @@ impl StreamGrid {
 			epoch: 0,
 			next_free: 0,
 			overruns: 0,
+			rebases: 0,
 			displacement_high_water: 0,
 			capacity: capacity.max(1),
 		}
@@ -421,11 +424,16 @@ impl StreamGrid {
 	/// that matches the silence is a *gap* — the source is still on the clock the
 	/// grid was built from, so the returning content belongs in the slots its PCR
 	/// says and needs no adjustment, which is how a leg that was cut off for
-	/// twenty seconds comes back into its partner's numbering.
+	/// twenty seconds comes back into its partner's numbering. So is a jump to a
+	/// slot this leg can still release, at or before `horizon`, the furthest slot
+	/// its buffer may hold: a source that froze upstream of the leg hands over the
+	/// last of its old content and the first of the new in one burst, with no
+	/// silence between them, and only a clock that moved puts content further
+	/// ahead than live content can be.
 	///
 	/// Returns the slot and whether it sits beyond the open run because the
 	/// source went quiet, which the caller must not spread that run across.
-	fn slot_for(&mut self, pcr: u64, since: Duration) -> (u64, bool) {
+	fn slot_for(&mut self, pcr: u64, since: Duration, horizon: Option<u64>) -> (u64, bool) {
 		let raw = self.map.slot_of_pcr(pcr);
 		let mut after_silence = false;
 		if let Some((open_pcr, open_slot)) = self.open {
@@ -437,7 +445,11 @@ impl StreamGrid {
 			// The factor is loose because delivery is bursty and the returning
 			// packet may sit in a relay buffer before it reaches us.
 			let explained_by_silence = delta > 0 && advanced <= since.saturating_mul(2);
-			if jumped && !explained_by_silence {
+			let on_grid = i128::from(raw) + self.epoch;
+			let within_horizon = delta > 0
+				&& on_grid > i128::from(open_slot)
+				&& horizon.is_some_and(|horizon| on_grid <= i128::from(horizon));
+			if jumped && !explained_by_silence && !within_horizon {
 				// The source clock moved. Continue the grid from where the open run
 				// ends: both legs of a pair compute the same continuation, so an
 				// aligned pair stays aligned — but a leg that joins *after* a splice
@@ -445,6 +457,7 @@ impl StreamGrid {
 				// clocking.
 				let resume_at = open_slot.saturating_add(self.run.len().max(1) as u64);
 				self.epoch = i128::from(resume_at) - i128::from(raw);
+				self.rebases = self.rebases.saturating_add(1);
 			} else if i128::from(raw) + self.epoch < i128::from(open_slot) {
 				// The 33-bit PCR value wrapped; the stream did not.
 				self.epoch += i128::from(self.map.slots_per_wrap());
@@ -457,7 +470,9 @@ impl StreamGrid {
 
 	/// Accept one input packet. Returns the number of packets dropped for want of
 	/// room, so the caller can count them.
-	fn push(&mut self, packet: Packet, now: Instant) -> u64 {
+	/// `horizon` is the furthest slot the leg's buffer may hold, once its output
+	/// clock has started; see [`StreamGrid::slot_for`].
+	fn push(&mut self, packet: Packet, now: Instant, horizon: Option<u64>) -> u64 {
 		self.note_continuity(&packet);
 		let Some(pcr) = packet.pcr() else {
 			// Before the first PCR there is no grid to place against. Buffering
@@ -472,7 +487,7 @@ impl StreamGrid {
 		let since = self
 			.open_at
 			.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
-		let (slot, after_silence) = self.slot_for(pcr, since);
+		let (slot, after_silence) = self.slot_for(pcr, since, horizon);
 		let missed = self.run_broken
 			&& self
 				.open
@@ -628,6 +643,11 @@ impl StreamGrid {
 	/// Runs that carried more packets than their own PCR span had slots for.
 	fn overruns(&self) -> u64 {
 		self.overruns
+	}
+
+	/// Times the grid was re-based because the source clock moved.
+	fn rebases(&self) -> u64 {
+		self.rebases
 	}
 
 	/// Discard a run left open by the end of the source.
@@ -833,10 +853,13 @@ impl Scheduler {
 			.observe(now, self.media.estimated_rate_pps().unwrap_or(0.0));
 		self.resize();
 
+		let started = self.stats.output_packets + self.stats.withheld_packets > 0;
+		let horizon = started.then(|| self.slot.saturating_add(self.max_latency_packets));
 		if let Some(grid) = self.grid.as_mut() {
-			let dropped = grid.push(packet, now);
+			let dropped = grid.push(packet, now, horizon);
 			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(dropped);
 			self.stats.pcr_position_overruns = grid.overruns();
+			self.stats.pcr_rebases = grid.rebases();
 			self.stats.pcr_position_displacement = grid.displacement_high_water();
 			// The clock can only start once something has been placed: where the
 			// grid starts is what the wall clock is anchored to.
@@ -2537,6 +2560,70 @@ mod tests {
 				.count();
 			assert!(back > 0, "the leg never came back after missing runs {from}..{to}");
 		}
+	}
+
+	#[test]
+	fn a_leg_whose_source_froze_never_contradicts_its_partner() {
+		// T59's packager freeze: one leg's packager stops for longer than a PCR
+		// jump may span before it reads as a splice, and loses what its input
+		// buffer could not hold. The segment it had open is published only after
+		// it resumes, so the leg hears nothing, then receives the last of the old
+		// content and the first of the new in one fetch, milliseconds apart. No
+		// silence precedes the jump, yet the source clock never moved: re-basing
+		// on it puts the rest of the run under its partner's sequence numbers.
+		let cfg = stream_config()
+			.with_latency(Duration::from_secs(7))
+			.with_max_latency(Duration::from_secs(14))
+			.with_packets_per_datagram(7)
+			.with_stall_timeout(Some(Duration::from_millis(200)));
+		let runs = 4_400;
+		let (published, frozen, thawed, closed) = (1_100, 1_200, 2_400, 2_500);
+		let whole = tagged(stream_packets(runs));
+		let run_of = |index: usize| index / RUN_LEN;
+		let fetched_at = whole[closed * RUN_LEN].1;
+		let mut burst = 0;
+		let frozen_leg: Vec<_> = whole
+			.iter()
+			.enumerate()
+			.filter(|(index, _)| !(frozen..thawed).contains(&run_of(*index)))
+			.map(|(index, (packet, at))| {
+				let late = (published..frozen).contains(&run_of(index)) || (thawed..closed).contains(&run_of(index));
+				if !late {
+					return (packet.clone(), *at);
+				}
+				burst += 1;
+				(packet.clone(), fetched_at + Duration::from_micros(burst))
+			})
+			.collect();
+		let t0 = Instant::now();
+		let until = (runs as u64 - 20) * RUN_SLOTS;
+		let partner = run_leg(&cfg, &whole, t0, &PUNCTUAL, until);
+		let leg = run_leg(&cfg, &frozen_leg, t0, &PUNCTUAL, until);
+		assert_never_contradicts(&leg, &partner);
+		let back = leg
+			.iter()
+			.filter(|(framing, _)| framing.slot > (closed as u64 + 5) * RUN_SLOTS)
+			.count();
+		assert!(back > 0, "the leg never came back after its source froze");
+	}
+
+	#[test]
+	fn a_stream_clocked_leg_counts_the_splices_it_re_bases_on() {
+		// The counter is how an operator tells a source whose clock moved from a
+		// leg that missed stream. Under stream clocking it never moved, which hid
+		// T59's spurious re-base behind a reading of zero.
+		let mut stream = Vec::new();
+		for run in 0..400_u64 {
+			let jump = if run >= 200 { 2_000 } else { 0 };
+			let pcr = (run + jump) * RUN_SLOTS * TICKS_PER_PACKET;
+			let at = pcr::ticks_to_duration(run * RUN_SLOTS * TICKS_PER_PACKET);
+			for index in 0..RUN_LEN as u64 {
+				let packet = content_packet(0x100, (index == 0).then_some(pcr));
+				stream.push((packet, at + Duration::from_micros(index * 10)));
+			}
+		}
+		let (stats, _) = drive_leg(&stream_config(), &stream);
+		assert_eq!(stats.pcr_rebases, 1, "a ten-second splice on time was not counted");
 	}
 
 	#[test]
