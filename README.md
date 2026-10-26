@@ -360,7 +360,8 @@ because an ST 2022-7 receiver keeps whichever datagram arrives first, and a gues
 replaces programme under the same sequence number. So it stays silent, counting
 the slots in `withheld_packets`, past the last PCR it has received, across any
 stretch of the stream it missed (a PCR interval twice the longest of the last
-eight, or a jump its own silence explains), and until a content PCR has gone out
+eight across which a continuity counter broke, or a jump its own silence
+explains), and until a content PCR has gone out
 in its own slot since either, which is when its re-insertion state is the
 stream's again. A run whose closing PCR it never received, including the last one
 when its source ends, is discarded and counted in `cut_runs_packets` rather than

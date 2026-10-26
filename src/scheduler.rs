@@ -87,8 +87,17 @@ const RECENT_SPANS: usize = 8;
 /// How many times the longest recent PCR interval an interval must reach before
 /// it counts as spanning PCRs the leg did not receive. Two, because a leg that
 /// misses one PCR of a regular source sees an interval twice the source's own.
-/// On an irregular cadence a single missed PCR can stay under it.
+/// On an irregular cadence a single missed PCR can stay under it, and an intact
+/// interval can reach it: a source whose PCR spacing runs from a fraction of a
+/// millisecond to 25 ms meets it every few seconds. So a long interval counts as
+/// missed only if the continuity counters since the last PCR also break.
 const MISSED_PCR_FACTOR: u64 = 2;
+
+/// Continuity state of a PID not yet seen, in [`StreamGrid::continuity`].
+const CC_UNSEEN: u8 = 0xff;
+/// Set beside the counter once a payload packet has repeated it: the standard
+/// allows one duplicate, so a second repeat is a discontinuity.
+const CC_REPEATED: u8 = 0x10;
 
 /// Recovers the source media rate from PCR deltas and paces content release.
 #[derive(Debug)]
@@ -344,6 +353,12 @@ struct StreamGrid {
 	recent_spans: VecDeque<u64>,
 	/// Packets discarded with runs that had no closing PCR to place them by.
 	cut: u64,
+	/// Each PID's last continuity counter, with [`CC_REPEATED`] beside it once
+	/// repeated; [`CC_UNSEEN`] before its first packet.
+	continuity: Box<[u8; 8192]>,
+	/// Whether a continuity counter has broken since the open run's PCR, which
+	/// is the evidence that a long interval really spans stream this leg missed.
+	run_broken: bool,
 	/// The run being accumulated: its opening PCR packet, then the rest.
 	run: Vec<Packet>,
 	/// `(source PCR, absolute slot)` of the packet that opened the run.
@@ -377,6 +392,8 @@ impl StreamGrid {
 			known_from: None,
 			recent_spans: VecDeque::with_capacity(RECENT_SPANS),
 			cut: 0,
+			continuity: Box::new([CC_UNSEEN; 8192]),
+			run_broken: false,
 			run: Vec::new(),
 			open: None,
 			open_at: None,
@@ -441,6 +458,7 @@ impl StreamGrid {
 	/// Accept one input packet. Returns the number of packets dropped for want of
 	/// room, so the caller can count them.
 	fn push(&mut self, packet: Packet, now: Instant) -> u64 {
+		self.note_continuity(&packet);
 		let Some(pcr) = packet.pcr() else {
 			// Before the first PCR there is no grid to place against. Buffering
 			// these would only let them land in slots chosen by arrival order.
@@ -455,9 +473,11 @@ impl StreamGrid {
 			.open_at
 			.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
 		let (slot, after_silence) = self.slot_for(pcr, since);
-		let missed = self
-			.open
-			.is_some_and(|(_, open_slot)| self.missed_pcrs(slot.saturating_sub(open_slot)));
+		let missed = self.run_broken
+			&& self
+				.open
+				.is_some_and(|(_, open_slot)| self.missed_pcrs(slot.saturating_sub(open_slot)));
+		self.run_broken = false;
 		let dropped = if self.open.is_none() {
 			self.known_from = Some(slot);
 			0
@@ -541,6 +561,36 @@ impl StreamGrid {
 		let displacement = self.next_free.saturating_sub(next_slot);
 		self.displacement_high_water = self.displacement_high_water.max(displacement);
 		dropped
+	}
+
+	/// Record `packet`'s continuity counter, and whether it breaks its PID's.
+	///
+	/// A packet with a payload advances the counter by one or repeats it once; a
+	/// packet without one keeps it. A flagged discontinuity resets it, since the
+	/// source has declared the break.
+	fn note_continuity(&mut self, packet: &Packet) {
+		let b = packet.as_bytes();
+		let pid = usize::from(packet.pid());
+		let cc = b[3] & 0x0f;
+		let has_payload = b[3] & 0x10 != 0;
+		let declared = b[3] & 0x20 != 0 && b[4] > 0 && b[5] & 0x80 != 0;
+		let last = self.continuity[pid];
+		let next = if last == CC_UNSEEN || declared {
+			cc
+		} else if !has_payload {
+			if cc != last & 0x0f {
+				self.run_broken = true;
+			}
+			last
+		} else if cc == (last + 1) & 0x0f {
+			cc
+		} else if cc == last & 0x0f && last & CC_REPEATED == 0 {
+			cc | CC_REPEATED
+		} else {
+			self.run_broken = true;
+			cc
+		};
+		self.continuity[pid] = next;
 	}
 
 	/// Whether a PCR interval of `span` slots is too long to be one the source
@@ -2209,6 +2259,79 @@ mod tests {
 			run += burst;
 		}
 		out
+	}
+
+	/// A live encoder's cadence: eight short PCR intervals, then one four times as
+	/// long, with every packet's continuity counter advancing as a real mux's does.
+	fn stream_packets_irregular(cycles: usize) -> Vec<(Packet, Duration)> {
+		let mut out = Vec::new();
+		let (mut slot, mut cc) = (0_u64, 0_u8);
+		for _ in 0..cycles {
+			for span in [1_u64, 1, 1, 1, 1, 1, 1, 1, 4] {
+				let pcr = slot * TICKS_PER_PACKET;
+				let at = pcr::ticks_to_duration(pcr);
+				for index in 0..span * RUN_SLOTS / 5 {
+					let mut bytes = content_packet(0x100, (index == 0).then_some(pcr)).as_bytes().to_vec();
+					bytes[3] |= cc;
+					cc = (cc + 1) & 0x0f;
+					out.push((
+						Packet::from_slice(&bytes).unwrap(),
+						at + Duration::from_micros(index * 10),
+					));
+				}
+				slot += span * RUN_SLOTS;
+			}
+		}
+		out
+	}
+
+	/// Feed `stream` to one stream-clocked leg on time and emit until it is all in;
+	/// return the counters and what was withheld after the first datagram went out.
+	fn drive_leg(cfg: &Config, stream: &[(Packet, Duration)]) -> (Stats, u64) {
+		let mut sched = Scheduler::new(cfg);
+		let t0 = Instant::now();
+		let (mut next, mut withheld_at_start) = (0, None);
+		while next < stream.len() {
+			let (packet, at) = &stream[next];
+			if sched.next_due().is_none_or(|due| t0 + *at <= due) {
+				sched.enqueue(packet.clone(), t0 + *at);
+				next += 1;
+				continue;
+			}
+			let due = sched.next_due().expect("checked above");
+			if !sched.emit_datagram(due).is_empty() && withheld_at_start.is_none() {
+				withheld_at_start = Some(sched.stats().withheld_packets);
+			}
+		}
+		let stats = sched.stats();
+		let after = stats.withheld_packets - withheld_at_start.expect("the leg never sent");
+		(stats, after)
+	}
+
+	#[test]
+	fn an_intact_stream_with_an_irregular_pcr_cadence_is_never_cut() {
+		// The live feed spaces its PCRs from a fraction of a millisecond to 25 ms, so
+		// an interval twice the longest of the eight before it comes every few
+		// seconds. Delivered whole, none of it is stream the leg missed: discarding
+		// the run and falling silent until it re-phases costs a release latency of
+		// programme, on both legs of a pair at once.
+		let cfg = stream_config().with_packets_per_datagram(7);
+		let whole = stream_packets_irregular(60);
+		let (stats, withheld) = drive_leg(&cfg, &whole);
+		assert_eq!(stats.cut_runs_packets, 0, "an intact run was discarded");
+		assert_eq!(withheld, 0, "the leg fell silent on an intact stream");
+
+		// The control: the same stream with real packets missing still breaks the
+		// counters, and the run that spans the hole is still discarded.
+		let per_cycle = whole.len() / 60;
+		let gapped: Vec<_> = whole
+			.iter()
+			.enumerate()
+			.filter(|(index, _)| !(20 * per_cycle + 3..20 * per_cycle + 90).contains(index))
+			.map(|(_, arrival)| arrival.clone())
+			.collect();
+		let (stats, _) = drive_leg(&cfg, &gapped);
+		assert!(stats.cut_runs_packets > 0, "a run spanning missing stream was kept");
 	}
 
 	/// The same volume and the same PCR values, spread evenly — the control.
