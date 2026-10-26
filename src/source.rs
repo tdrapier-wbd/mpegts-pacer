@@ -7,7 +7,7 @@
 
 use std::future::Future;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
 use crate::error::Result;
 use crate::packet::{Packet, TS_PACKET_SIZE};
@@ -39,17 +39,26 @@ pub trait Source {
 /// file, or process stdin (e.g. the `moq ... export ts` output) and it hands
 /// whole transport packets to the pacer. It resynchronises on the `0x47` sync
 /// byte if the stream slips, and discards a trailing partial packet at EOF.
+///
+/// The reader is buffered. Each read on `tokio::io::stdin()` is a round trip
+/// to tokio's blocking pool, so reading it a packet at a time caps ingest at a
+/// few times a broadcast mux rate: a burst such as a fetched segment then
+/// reaches the scheduler spread over hundreds of milliseconds, in proportion to
+/// its size, and an aligned leg reads that spread as path delay.
 pub struct ReadSource<R> {
-	reader: R,
+	reader: BufReader<R>,
 	buf: [u8; TS_PACKET_SIZE],
 	filled: usize,
 }
+
+/// Bytes [`ReadSource`] asks its reader for at a time.
+const READ_BUFFER: usize = 64 * 1024;
 
 impl<R: AsyncRead + Unpin + Send> ReadSource<R> {
 	/// Wrap an [`AsyncRead`] as a packet source.
 	pub fn new(reader: R) -> Self {
 		Self {
-			reader,
+			reader: BufReader::with_capacity(READ_BUFFER, reader),
 			buf: [0; TS_PACKET_SIZE],
 			filled: 0,
 		}
@@ -103,5 +112,51 @@ where
 {
 	async fn recv(&mut self) -> Result<Option<Packet>> {
 		Ok(self.iter.next())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::io;
+	use std::pin::Pin;
+	use std::task::{Context, Poll};
+
+	use tokio::io::ReadBuf;
+
+	use super::*;
+
+	/// A reader over `data` that counts the reads it is asked for, as each
+	/// read on process stdin costs a trip to tokio's blocking pool.
+	struct Counting {
+		data: Vec<u8>,
+		at: usize,
+		reads: usize,
+	}
+
+	impl AsyncRead for Counting {
+		fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+			self.reads += 1;
+			let n = buf.remaining().min(self.data.len() - self.at);
+			buf.put_slice(&self.data[self.at..self.at + n]);
+			self.at += n;
+			Poll::Ready(Ok(()))
+		}
+	}
+
+	#[tokio::test]
+	async fn a_burst_is_read_in_few_reads() {
+		let packets = 2_000;
+		let mut data = vec![0u8; packets * TS_PACKET_SIZE];
+		for packet in data.chunks_mut(TS_PACKET_SIZE) {
+			packet[0] = crate::packet::SYNC_BYTE;
+		}
+		let mut source = ReadSource::new(Counting { data, at: 0, reads: 0 });
+		let mut got = 0;
+		while source.recv().await.unwrap().is_some() {
+			got += 1;
+		}
+		assert_eq!(got, packets);
+		let reads = source.reader.get_ref().reads;
+		assert!(reads <= 8, "{packets} packets took {reads} reads");
 	}
 }
