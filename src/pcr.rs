@@ -16,7 +16,8 @@ pub const PCR_WRAP_TICKS: u64 = (1_u64 << 33) * 300;
 pub const PACKET_BITS: u128 = (TS_PACKET_SIZE as u128) * 8;
 
 /// A source PCR forward jump larger than this is treated as a discontinuity
-/// (loop wrap / splice) rather than a real elapsed interval.
+/// (loop wrap / splice) rather than a real elapsed interval. A shorter one is a
+/// discontinuity only where the source declares it ([`declares_discontinuity`]).
 pub const PCR_DISCONTINUITY_GAP: Duration = Duration::from_secs(5);
 
 /// Read the 27 MHz PCR from a packet's adaptation field, if it carries one.
@@ -74,6 +75,13 @@ pub fn set_discontinuity_indicator(packet: &mut [u8]) -> bool {
 	}
 	packet[5] |= 0x80;
 	true
+}
+
+/// Whether a packet's adaptation field sets the discontinuity_indicator. On a
+/// PCR-bearing packet that is the source declaring that its PCR starts a new
+/// time base, which no inference from the PCR values can tell for a short step.
+pub fn declares_discontinuity(packet: &[u8]) -> bool {
+	packet.len() == TS_PACKET_SIZE && packet[3] & 0x20 != 0 && packet[4] > 0 && packet[5] & 0x80 != 0
 }
 
 /// Forward distance from `previous` to `current` on the wrapping PCR clock.
@@ -151,7 +159,7 @@ impl PcrRegen {
 			None => false,
 			Some(last) => {
 				let delta = forward_delta(last, src);
-				delta == 0 || ticks_to_duration(delta) > PCR_DISCONTINUITY_GAP
+				declares_discontinuity(packet) || delta == 0 || ticks_to_duration(delta) > PCR_DISCONTINUITY_GAP
 			}
 		};
 		self.last_src = Some(src);
@@ -280,6 +288,27 @@ mod tests {
 		assert!(regen.rewrite(&mut b, 7));
 		assert_eq!(read_pcr(&b), Some(123_456), "PCR re-bases to the new source value");
 		assert!(b[5] & 0x80 != 0, "re-base sets the discontinuity indicator");
+	}
+
+	#[test]
+	fn rebases_on_a_declared_step_too_short_to_infer() {
+		// A forward step under the gap reads as elapsed time unless the source says
+		// otherwise. Byte-locked across a step it declared, the PCR would leave the
+		// content after it a step away from its PTS.
+		let mut plain = PcrRegen::new(12_000_000);
+		let mut declared = PcrRegen::new(12_000_000);
+		plain.rewrite(&mut pcr_packet(PCR_CLOCK_HZ), 0);
+		declared.rewrite(&mut pcr_packet(PCR_CLOCK_HZ), 0);
+
+		let mut b = pcr_packet(3 * PCR_CLOCK_HZ);
+		assert!(!plain.rewrite(&mut b, 7), "an unflagged 2 s step is elapsed time");
+		let mut c = pcr_packet(3 * PCR_CLOCK_HZ);
+		c[5] |= 0x80;
+		assert!(
+			declared.rewrite(&mut c, 7),
+			"a declared step re-bases whatever its size"
+		);
+		assert_eq!(read_pcr(&c), Some(3 * PCR_CLOCK_HZ));
 	}
 
 	#[test]

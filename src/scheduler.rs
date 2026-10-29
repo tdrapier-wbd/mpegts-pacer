@@ -99,6 +99,15 @@ const CC_UNSEEN: u8 = 0xff;
 /// allows one duplicate, so a second repeat is a discontinuity.
 const CC_REPEATED: u8 = 0x10;
 
+/// The source time base a content packet is on under stream clocking: how many
+/// slots re-bases have moved the grid from it, and whether this packet is the
+/// first on it, which is where the emitted PCR says the clock changed.
+#[derive(Clone, Copy, Debug, Default)]
+struct Base {
+	offset: i128,
+	starts: bool,
+}
+
 /// Recovers the source media rate from PCR deltas and paces content release.
 #[derive(Debug)]
 struct MediaClock {
@@ -201,9 +210,13 @@ impl MediaClock {
 		if let Some(last) = self.last_pcr {
 			let delta = pcr::forward_delta(last, pcr);
 			let secs = pcr::ticks_to_duration(delta).as_secs_f64();
-			// Ignore zero deltas and discontinuities (loop wrap / splice); those
-			// don't reflect a real elapsed interval.
-			if delta > 0 && secs > 0.0 && pcr::ticks_to_duration(delta) <= pcr::PCR_DISCONTINUITY_GAP {
+			// Ignore zero deltas and discontinuities (loop wrap / splice, inferred
+			// or declared); those don't reflect a real elapsed interval.
+			if delta > 0
+				&& secs > 0.0
+				&& pcr::ticks_to_duration(delta) <= pcr::PCR_DISCONTINUITY_GAP
+				&& !pcr::declares_discontinuity(packet.as_bytes())
+			{
 				if secs < MIN_RATE_SAMPLE {
 					self.sub_ms_intervals = self.sub_ms_intervals.saturating_add(1);
 				}
@@ -373,6 +386,18 @@ struct StreamGrid {
 	/// PCR wrap or a source discontinuity. Signed, because a splice can move the
 	/// source clock either way.
 	epoch: i128,
+	/// The part of `epoch` that re-bases put there, as opposed to PCR wraps:
+	/// how far the grid's slots now sit from the source's time base.
+	rebased: i128,
+	/// `rebased` as it stood when the open run's PCR arrived, and when the last
+	/// placed run's did.
+	open_base: i128,
+	placed_base: i128,
+	/// Each change of time base among the placed packets: the slot of the first
+	/// packet on it, and its offset. Consumed by [`StreamGrid::take`].
+	bases: VecDeque<(u64, i128)>,
+	/// The offset of the last packet [`StreamGrid::take`] passed.
+	taken_base: i128,
 	/// The lowest slot still free. A PCR interval carrying more packets than the
 	/// mux rate has room for spills into the slots after it rather than losing
 	/// the excess; see [`StreamGrid::close_run`].
@@ -401,6 +426,11 @@ impl StreamGrid {
 			open_at: None,
 			placed: VecDeque::new(),
 			epoch: 0,
+			rebased: 0,
+			open_base: 0,
+			placed_base: 0,
+			bases: VecDeque::new(),
+			taken_base: 0,
 			next_free: 0,
 			overruns: 0,
 			rebases: 0,
@@ -431,9 +461,17 @@ impl StreamGrid {
 	/// silence between them, and only a clock that moved puts content further
 	/// ahead than live content can be.
 	///
+	/// A step the source `declared` needs neither the gap nor the horizon to be
+	/// a splice: it is one however short, and wherever it lands. Only this leg's
+	/// own silence can still
+	/// account for it, as it does for an origin that restarts on the same clock and
+	/// says so. On a segmented leg, whose input is quiet for a segment between
+	/// fetches, that leaves a declared step shorter than about twice the fetch
+	/// interval read as the clock carrying on.
+	///
 	/// Returns the slot and whether it sits beyond the open run because the
 	/// source went quiet, which the caller must not spread that run across.
-	fn slot_for(&mut self, pcr: u64, since: Duration, horizon: Option<u64>) -> (u64, bool) {
+	fn slot_for(&mut self, pcr: u64, declared: bool, since: Duration, horizon: Option<u64>) -> (u64, bool) {
 		let raw = self.map.slot_of_pcr(pcr);
 		let mut after_silence = false;
 		if let Some((open_pcr, open_slot)) = self.open {
@@ -449,14 +487,16 @@ impl StreamGrid {
 			let within_horizon = delta > 0
 				&& on_grid > i128::from(open_slot)
 				&& horizon.is_some_and(|horizon| on_grid <= i128::from(horizon));
-			if jumped && !explained_by_silence && !within_horizon {
+			if (jumped || declared) && !explained_by_silence && (declared || !within_horizon) {
 				// The source clock moved. Continue the grid from where the open run
 				// ends: both legs of a pair compute the same continuation, so an
 				// aligned pair stays aligned — but a leg that joins *after* a splice
 				// cannot know it happened, which is a documented limit of stream
 				// clocking.
 				let resume_at = open_slot.saturating_add(self.run.len().max(1) as u64);
-				self.epoch = i128::from(resume_at) - i128::from(raw);
+				let epoch = i128::from(resume_at) - i128::from(raw);
+				self.rebased += epoch - self.epoch;
+				self.epoch = epoch;
 				self.rebases = self.rebases.saturating_add(1);
 			} else if i128::from(raw) + self.epoch < i128::from(open_slot) {
 				// The 33-bit PCR value wrapped; the stream did not.
@@ -487,7 +527,8 @@ impl StreamGrid {
 		let since = self
 			.open_at
 			.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
-		let (slot, after_silence) = self.slot_for(pcr, since, horizon);
+		let declared = pcr::declares_discontinuity(packet.as_bytes());
+		let (slot, after_silence) = self.slot_for(pcr, declared, since, horizon);
 		let missed = self.run_broken
 			&& self
 				.open
@@ -508,6 +549,7 @@ impl StreamGrid {
 			self.close_run(slot)
 		};
 		self.open = Some((pcr, slot));
+		self.open_base = self.rebased;
 		self.open_at = Some(now);
 		self.run.clear();
 		self.run.push(packet);
@@ -563,6 +605,10 @@ impl StreamGrid {
 		for (index, packet) in self.run.drain(..).enumerate() {
 			let ideal = open_slot + (index as u64).saturating_mul(span) / count as u64;
 			let slot = ideal.max(self.next_free);
+			if index == 0 && self.open_base != self.placed_base {
+				self.bases.push_back((slot, self.open_base));
+				self.placed_base = self.open_base;
+			}
 			self.next_free = slot + 1;
 			self.placed.push_back((slot, packet));
 			if self.placed.len() > self.capacity {
@@ -588,7 +634,7 @@ impl StreamGrid {
 		let pid = usize::from(packet.pid());
 		let cc = b[3] & 0x0f;
 		let has_payload = b[3] & 0x10 != 0;
-		let declared = b[3] & 0x20 != 0 && b[4] > 0 && b[5] & 0x80 != 0;
+		let declared = pcr::declares_discontinuity(b);
 		let last = self.continuity[pid];
 		let next = if last == CC_UNSEEN || declared {
 			cc
@@ -660,23 +706,43 @@ impl StreamGrid {
 		self.run.clear();
 	}
 
-	/// The packet due at `slot`, discarding any whose slot has already passed.
-	/// A late packet is never re-placed: moving it would make its position a
-	/// function of the delay rather than of the stream.
-	fn take(&mut self, slot: u64) -> (Option<Packet>, u64) {
+	/// The packet due at `slot`, with the time base it is on, discarding any
+	/// whose slot has already passed. A late packet is never re-placed: moving it
+	/// would make its position a function of the delay rather than of the stream.
+	fn take(&mut self, slot: u64) -> (Option<(Packet, Base)>, u64) {
 		let mut late = 0;
-		while let Some((placed_slot, _)) = self.placed.front() {
-			if *placed_slot < slot {
-				self.placed.pop_front();
-				late += 1;
-			} else if *placed_slot == slot {
-				let (_, packet) = self.placed.pop_front().expect("front checked");
-				return (Some(packet), late);
-			} else {
+		while let Some(placed_slot) = self.placed.front().map(|(placed, _)| *placed) {
+			if placed_slot > slot {
 				break;
 			}
+			let mut starts = false;
+			while let Some(&(from, offset)) = self.bases.front() {
+				if from > placed_slot {
+					break;
+				}
+				starts = from == placed_slot;
+				self.taken_base = offset;
+				self.bases.pop_front();
+			}
+			let (_, packet) = self.placed.pop_front().expect("front checked");
+			if placed_slot < slot {
+				late += 1;
+				continue;
+			}
+			let base = Base {
+				offset: self.taken_base,
+				starts,
+			};
+			return (Some((packet, base)), late);
 		}
 		(None, late)
+	}
+
+	/// The emitted PCR for output slot `slot` on a time base `offset` slots
+	/// from the grid: the source's own value, quantised to the slot.
+	fn pcr_on(&self, slot: u64, offset: i128) -> u64 {
+		self.map
+			.pcr_of_slot(u64::try_from(i128::from(slot) - offset).unwrap_or(0))
 	}
 
 	/// The slot of the earliest packet awaiting emission.
@@ -723,11 +789,14 @@ pub struct Scheduler {
 	pcr_pid_cc: u8,
 	/// Output index of the most recent PCR (content or re-inserted).
 	last_pcr_index: Option<u64>,
+	/// The time base of the most recent content PCR, which a re-inserted one
+	/// continues. Only stream clocking has more than one.
+	pcr_base: i128,
 	/// PCR re-insertion threshold, in output packets at the mux rate.
 	pcr_max_packets: u64,
 	/// Content admitted to the output but not yet transmitted, because a slot it
 	/// would have used was taken by a re-inserted PCR. See [`Scheduler::admit`].
-	deferred: VecDeque<Packet>,
+	deferred: VecDeque<(Packet, Base)>,
 	/// Wall time the output slot at `anchor_slot` is due (first content + latency).
 	anchor: Option<Instant>,
 	/// The output slot the wall-clock anchor refers to. Zero under
@@ -808,6 +877,7 @@ impl Scheduler {
 			pcr_pid: None,
 			pcr_pid_cc: 0,
 			last_pcr_index: None,
+			pcr_base: 0,
 			// Inject with margin below the hard limit so datagram granularity and
 			// waiting for a stuffing slot can't push an interval past it.
 			pcr_max_packets: latency_to_packets(config.pcr_max_interval.mul_f64(0.75), bitrate).max(1) as u64,
@@ -1329,7 +1399,7 @@ impl Scheduler {
 				if send {
 					self.stats.pcr_inserted = self.stats.pcr_inserted.saturating_add(1);
 				}
-			} else if let Some(packet) = self.deferred.pop_front() {
+			} else if let Some((packet, base)) = self.deferred.pop_front() {
 				let is_pcr = packet.has_pcr();
 				if is_pcr && admitted && self.deferred.is_empty() && determined == Some(true) {
 					self.phased = true;
@@ -1343,9 +1413,17 @@ impl Scheduler {
 					let slice = &mut self.scratch[start..start + TS_PACKET_SIZE];
 					let rebased = match self.grid.as_ref() {
 						// The slot *is* the clock, so there is no anchor to re-base
-						// on and no per-process history in the emitted value.
+						// on and no per-process history in the emitted value. A
+						// re-base only offsets it, back onto the source's new time
+						// base, which the content's PTS are on.
 						Some(grid) => {
-							regen.rewrite_absolute(slice, grid.map.pcr_of_slot(index));
+							regen.rewrite_absolute(slice, grid.pcr_on(index, base.offset));
+							if is_pcr {
+								self.pcr_base = base.offset;
+								if base.starts {
+									pcr::set_discontinuity_indicator(slice);
+								}
+							}
 							false
 						}
 						None => regen.rewrite(slice, index),
@@ -1397,11 +1475,11 @@ impl Scheduler {
 	/// `deferred` is occupied, because a packet whose slot passes unasked is
 	/// discarded by [`StreamGrid::take`] as late.
 	fn admit(&mut self, index: u64, want_content: bool) -> bool {
-		let Some(packet) = self.next_content(index, want_content) else {
+		let Some(content) = self.next_content(index, want_content) else {
 			return false;
 		};
 		self.media.released = self.media.released.saturating_add(1);
-		self.deferred.push_back(packet);
+		self.deferred.push_back(content);
 		true
 	}
 
@@ -1450,9 +1528,12 @@ impl Scheduler {
 	/// clocking asks whether the media clock says a packet is *due now*, stream
 	/// clocking asks whether a packet *belongs in this slot*. The first depends on
 	/// when this process got round to emitting; the second does not.
-	fn next_content(&mut self, index: u64, want_content: bool) -> Option<Packet> {
+	fn next_content(&mut self, index: u64, want_content: bool) -> Option<(Packet, Base)> {
 		let Some(grid) = self.grid.as_mut() else {
-			return want_content.then(|| self.buffer.pop()).flatten();
+			return want_content
+				.then(|| self.buffer.pop())
+				.flatten()
+				.map(|packet| (packet, Base::default()));
 		};
 		let (packet, late) = grid.take(index);
 		if late > 0 {
@@ -1491,11 +1572,11 @@ impl Scheduler {
 		if index.saturating_sub(last) < self.pcr_max_packets {
 			return None;
 		}
-		if self.deferred.front().is_some_and(Packet::has_pcr) {
+		if self.deferred.front().is_some_and(|(packet, _)| packet.has_pcr()) {
 			return None;
 		}
 		match self.grid.as_ref() {
-			Some(grid) => Some(grid.map.pcr_of_slot(index)),
+			Some(grid) => Some(grid.pcr_on(index, self.pcr_base)),
 			None => regen.locked_for_index(index),
 		}
 	}
@@ -1779,6 +1860,34 @@ mod tests {
 		assert!(
 			estimate > truth * 0.5,
 			"estimate {estimate:.0} pps collapsed below the true {truth:.0} pps"
+		);
+	}
+
+	#[test]
+	fn media_rate_skips_the_interval_across_a_declared_step() {
+		// The interval across a step the source declared measures the step, not
+		// media. Counted, a 2 s step carrying one interval's packets reads as two
+		// seconds of almost nothing, and the release rate falls by most of itself.
+		let mut sched = Scheduler::new(&config().with_latency(Duration::from_millis(500)));
+		let t0 = Instant::now();
+		let (per_interval, interval) = (100_u64, PCR_CLOCK_HZ / 40);
+		let mut ticks = 0;
+		for i in 0..320 {
+			let mut first = content_packet(0x100, Some(ticks)).as_bytes().to_vec();
+			if i == 300 {
+				first[5] |= 0x80;
+			}
+			sched.enqueue(Packet::from_slice(&first).unwrap(), t0);
+			for _ in 1..per_interval {
+				sched.enqueue(content_packet(0x100, None), t0);
+			}
+			ticks += if i == 299 { 2 * PCR_CLOCK_HZ } else { interval };
+		}
+		let truth = per_interval as f64 * 40.0;
+		let estimate = sched.stats().media_rate_bps as f64 / PACKET_BITS as f64;
+		assert!(
+			(estimate / truth - 1.0).abs() < 0.1,
+			"estimate {estimate:.0} pps against a true {truth:.0} pps after a declared step"
 		);
 	}
 
@@ -2754,23 +2863,137 @@ mod tests {
 		assert!(back > 0, "the leg never came back after its source froze");
 	}
 
+	/// [`stream_packets`]'s source delivered on time, but with its PCR stepped
+	/// forward by `step` runs from run `at` on, and the step's first PCR flagged
+	/// as a discontinuity when `declared`.
+	fn stream_packets_stepped(runs: u64, at: u64, step: u64, declared: bool) -> Vec<(Packet, Duration)> {
+		let mut stream = Vec::new();
+		for run in 0..runs {
+			let pcr = (run + if run >= at { step } else { 0 }) * RUN_SLOTS * TICKS_PER_PACKET;
+			let arrival = pcr::ticks_to_duration(run * RUN_SLOTS * TICKS_PER_PACKET);
+			for index in 0..RUN_LEN as u64 {
+				let mut bytes = content_packet(0x100, (index == 0).then_some(pcr)).as_bytes().to_vec();
+				if declared && run == at && index == 0 {
+					bytes[5] |= 0x80;
+				}
+				stream.push((
+					Packet::from_slice(&bytes).unwrap(),
+					arrival + Duration::from_micros(index * 10),
+				));
+			}
+		}
+		stream
+	}
+
+	/// The index [`tagged`] wrote into an output packet.
+	fn tag_of(packet: &[u8]) -> usize {
+		u64::from_be_bytes(packet[TS_PACKET_SIZE - 8..].try_into().unwrap()) as usize
+	}
+
 	#[test]
 	fn a_stream_clocked_leg_counts_the_splices_it_re_bases_on() {
 		// The counter is how an operator tells a source whose clock moved from a
 		// leg that missed stream. Under stream clocking it never moved, which hid
 		// T59's spurious re-base behind a reading of zero.
-		let mut stream = Vec::new();
-		for run in 0..400_u64 {
-			let jump = if run >= 200 { 2_000 } else { 0 };
-			let pcr = (run + jump) * RUN_SLOTS * TICKS_PER_PACKET;
-			let at = pcr::ticks_to_duration(run * RUN_SLOTS * TICKS_PER_PACKET);
-			for index in 0..RUN_LEN as u64 {
-				let packet = content_packet(0x100, (index == 0).then_some(pcr));
-				stream.push((packet, at + Duration::from_micros(index * 10)));
-			}
-		}
-		let (stats, _) = drive_leg(&stream_config(), &stream);
+		let (stats, _) = drive_leg(&stream_config(), &stream_packets_stepped(400, 200, 2_000, false));
 		assert_eq!(stats.pcr_rebases, 1, "a ten-second splice on time was not counted");
+	}
+
+	#[test]
+	fn a_declared_step_too_short_to_infer_is_still_a_splice() {
+		// A receiver that hands HLS segments on flags the first PCR after an
+		// EXT-X-DISCONTINUITY. Unflagged, a forward step under the 5 s a jump must
+		// clear, landing inside what the buffer may hold, reads as the clock
+		// carrying on: the leg stuffs for the length of the step and holds that much
+		// more latency from then on. One second here, against a 2 s horizon.
+		let cfg = stream_config();
+		let (at, step) = (200, 200);
+		let boundary = at as usize * RUN_LEN;
+		let declared = tagged(stream_packets_stepped(400, at, step, true));
+		let (stats, _) = drive_leg(&cfg, &declared);
+		assert_eq!(stats.pcr_rebases, 1, "the declared step was not re-based on");
+
+		let leg = run_leg(&cfg, &declared, Instant::now(), &PUNCTUAL, 40_000);
+		let slots_of = |after: bool| {
+			leg.iter()
+				.filter(move |(_, dg)| pid_of(dg) == 0x100 && (tag_of(dg) >= boundary) == after)
+				.map(|(framing, _)| framing.slot)
+		};
+		let last_before = slots_of(false).max().expect("content before the step");
+		let first_after = slots_of(true).min().expect("content after the step");
+		assert!(
+			first_after - last_before <= 2,
+			"{} slots of stuffing across a step the source declared",
+			first_after - last_before
+		);
+
+		let (stats, _) = drive_leg(&cfg, &stream_packets_stepped(400, at, step, false));
+		assert_eq!(stats.pcr_rebases, 0, "an unflagged step this short is elapsed time");
+	}
+
+	#[test]
+	fn a_declared_step_the_leg_s_silence_accounts_for_is_not_a_splice() {
+		// An origin that restarts on the same clock marks the restart as a
+		// discontinuity. Re-based on, the leg that waited through the restart would
+		// resume a restart's length behind its partner's numbering and contradict
+		// it from then on: its silence is what says the clock carried on.
+		let cfg = stream_config().with_stall_timeout(Some(Duration::from_millis(200)));
+		let (from, to) = (300, 1_500);
+		let mut whole = tagged(stream_packets(1_600));
+		let mut first = whole[to * RUN_LEN].0.as_bytes().to_vec();
+		first[5] |= 0x80;
+		whole[to * RUN_LEN].0 = Packet::from_slice(&first).unwrap();
+		let gapped: Vec<_> = whole
+			.iter()
+			.enumerate()
+			.filter(|(i, _)| !(from * RUN_LEN..to * RUN_LEN).contains(i))
+			.map(|(_, p)| p.clone())
+			.collect();
+		let t0 = Instant::now();
+		let partner = run_leg(&cfg, &whole, t0, &PUNCTUAL, 64_000);
+		let leg = run_leg(&cfg, &gapped, t0, &JITTERY, 64_000);
+		assert_never_contradicts(&leg, &partner);
+		let back = leg
+			.iter()
+			.filter(|(f, dg)| f.slot > to as u64 * RUN_SLOTS && pid_of(dg) == 0x100);
+		assert!(back.count() > 500, "the leg did not come back onto its partner's grid");
+	}
+
+	#[test]
+	fn a_re_based_leg_emits_the_source_s_new_time_base() {
+		// The content after a splice carries PTS on the source's new time base. An
+		// emitted PCR that carried on from the old one would put every one of them a
+		// splice away from where the decoder's buffer model expects it, so the
+		// re-base moves the emitted clock too, and flags the first PCR on it. Each
+		// emitted PCR is the source's own, quantised to its slot: two legs that
+		// re-base on the same packet still emit the same bytes.
+		let cfg = stream_config();
+		let stream = tagged(stream_packets_stepped(400, 200, 2_000, false));
+		let t0 = Instant::now();
+		let leg = run_leg(&cfg, &stream, t0, &PUNCTUAL, 20_000);
+		let partner = run_leg(&cfg, &stream, t0, &JITTERY, 20_000);
+		assert_never_contradicts(&leg, &partner);
+
+		let mut checked = 0;
+		let mut flagged = Vec::new();
+		for (_, datagram) in &leg {
+			let Some(emitted) = pcr::read_pcr(datagram) else {
+				continue;
+			};
+			let tag = tag_of(datagram);
+			let source = stream[tag].0.pcr().expect("an emitted PCR is a source PCR here");
+			assert_eq!(emitted, source, "packet {tag} left the source's time base");
+			if datagram[5] & 0x80 != 0 {
+				flagged.push(tag);
+			}
+			checked += 1;
+		}
+		assert!(checked > 300, "only {checked} PCRs reached the wire");
+		assert_eq!(
+			flagged,
+			[200 * RUN_LEN],
+			"only the first PCR on the new time base is flagged"
+		);
 	}
 
 	#[test]

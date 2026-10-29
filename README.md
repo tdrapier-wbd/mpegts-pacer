@@ -344,8 +344,9 @@ Requires an explicit constant bitrate (an auto rate is measured from one
 process's arrival window, so two legs would lock different grids), an explicit
 latency (an adaptive cushion is measured the same way, so two legs would start on
 different slots and hold different depths), and `PcrMode::Regenerate` (the emitted
-PCR *is* the slot position, exact by construction rather than anchored on whichever
-PCR arrived first). The source must carry PCR; without it there is no grid.
+PCR *is* the slot position, offset only where a splice moved the source's time
+base, and exact by construction rather than anchored on whichever PCR arrived
+first). The source must carry PCR; without it there is no grid.
 `Config::validate()` rejects the rest rather than letting them produce output that
 merges badly.
 
@@ -366,6 +367,18 @@ content PCR has gone out in its own slot since either, which is when its
 re-insertion state is the stream's again. A run whose closing PCR it never received, including the last one
 when its source ends, is discarded and counted in `cut_runs_packets` rather than
 spread across slots it can only guess.
+
+A source whose clock moves is a splice, counted in `pcr_rebases`: any backward
+step, a forward one over 5 s that neither the leg's silence nor its buffer
+explains, or a step of any size the source flags with the discontinuity
+indicator. The grid carries on where the last run ends, so a pair that saw the
+splice stays aligned, and the emitted PCR moves onto the source's new time base,
+flagged, so the content's PTS stay where the decoder expects them. A flagged step
+the leg's own silence accounts for is not a splice: that is an origin restarting
+on the same clock. On a segmented input, quiet for a segment between fetches, a
+flagged step shorter than about twice the fetch interval is therefore paced as
+content, with a hole as long as the step and that much more latency. A leg that
+joins after a splice cannot know it happened.
 
 ### The positional assumption, and the guard on it
 
