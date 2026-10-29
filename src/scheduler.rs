@@ -466,7 +466,7 @@ impl StreamGrid {
 	/// own silence can still
 	/// account for it, as it does for an origin that restarts on the same clock and
 	/// says so. On a segmented leg, whose input is quiet for a segment between
-	/// fetches, that leaves a declared step shorter than about twice the fetch
+	/// fetches, that leaves a declared step no longer than about a fetch
 	/// interval read as the clock carrying on.
 	///
 	/// Returns the slot and whether it sits beyond the open run because the
@@ -481,8 +481,15 @@ impl StreamGrid {
 			// Content cannot arrive from the future: if we have been silent for
 			// roughly as long as the stream advanced, we simply missed the middle.
 			// The factor is loose because delivery is bursty and the returning
-			// packet may sit in a relay buffer before it reaches us.
-			let explained_by_silence = delta > 0 && advanced <= since.saturating_mul(2);
+			// packet may sit in a relay buffer before it reaches us. That is the
+			// benefit of the doubt an unflagged jump gets; a declared one is
+			// overruled only by a silence about as long as it.
+			let allowance = if declared {
+				since.saturating_add(since / 4)
+			} else {
+				since.saturating_mul(2)
+			};
+			let explained_by_silence = delta > 0 && advanced <= allowance;
 			let on_grid = i128::from(raw) + self.epoch;
 			let within_horizon = delta > 0
 				&& on_grid > i128::from(open_slot)
@@ -2929,6 +2936,27 @@ mod tests {
 
 		let (stats, _) = drive_leg(&cfg, &stream_packets_stepped(400, at, step, false));
 		assert_eq!(stats.pcr_rebases, 0, "an unflagged step this short is elapsed time");
+	}
+
+	#[test]
+	fn a_declared_step_longer_than_a_fetch_interval_is_a_splice_on_a_segmented_leg() {
+		// A segmented leg's input is quiet for a segment between fetches, so at a
+		// segment boundary the stream has always advanced less than the leg was
+		// silent. A declared step half a segment longer than that has not: only a
+		// clock that moved explains it. One-second segments, a 1.5 s step.
+		let segment = 200;
+		let mut sched = Scheduler::new(&stream_config());
+		let t0 = Instant::now();
+		for (index, (packet, _)) in stream_packets_stepped(800, 400, 300, true).into_iter().enumerate() {
+			let ends = (index / RUN_LEN / segment + 1) * segment;
+			let fetched = pcr::ticks_to_duration(ends as u64 * RUN_SLOTS * TICKS_PER_PACKET);
+			sched.enqueue(packet, t0 + fetched + Duration::from_micros(index as u64 % 1_000));
+		}
+		assert_eq!(
+			sched.stats().pcr_rebases,
+			1,
+			"the declared step was read as the fetch interval"
+		);
 	}
 
 	#[test]

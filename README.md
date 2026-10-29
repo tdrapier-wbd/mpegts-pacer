@@ -376,9 +376,8 @@ splice stays aligned, and the emitted PCR moves onto the source's new time base,
 flagged, so the content's PTS stay where the decoder expects them. A flagged step
 the leg's own silence accounts for is not a splice: that is an origin restarting
 on the same clock. On a segmented input, quiet for a segment between fetches, a
-flagged step shorter than about twice the fetch interval is therefore paced as
-content, with a hole as long as the step and that much more latency. A leg that
-joins after a splice cannot know it happened.
+flagged step no longer than about a fetch interval is therefore read as the clock
+carrying on. A leg that joins after a splice cannot know it happened.
 
 ### The positional assumption, and the guard on it
 
