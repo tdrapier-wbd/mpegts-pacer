@@ -65,6 +65,11 @@ impl JitterBuffer {
 	pub fn is_empty(&self) -> bool {
 		self.queue.is_empty()
 	}
+
+	/// Packets that can still be pushed before the oldest is dropped.
+	pub fn room(&self) -> usize {
+		self.capacity.saturating_sub(self.queue.len())
+	}
 }
 
 #[cfg(test)]

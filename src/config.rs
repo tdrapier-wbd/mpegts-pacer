@@ -392,6 +392,14 @@ impl Latency {
 		}
 	}
 
+	/// The shallowest cushion it holds: the pinned depth, or the adaptive floor.
+	pub fn floor(&self) -> Duration {
+		match *self {
+			Latency::Fixed { target, .. } => target,
+			Latency::Adaptive { floor, .. } => floor,
+		}
+	}
+
 	/// The longest the pacer will hold output back waiting to size its cushion.
 	/// `None` under [`Latency::Fixed`], which starts on a timer instead.
 	pub fn start_deadline(&self) -> Option<Duration> {

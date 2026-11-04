@@ -1086,6 +1086,14 @@ impl Scheduler {
 	/// below [`crate::DELIVERY_GAP`] — so it starts as soon as it is primed,
 	/// exactly as it did before any of this existed. The deadline covers the
 	/// input that fits neither description.
+	///
+	/// A buffer with less room left than the floor also starts it. A feed that
+	/// starts with a backlog and then streams never pauses between deliveries,
+	/// and every packet it delivers to a full buffer pushes out the oldest, so
+	/// waiting on cannot size the cushion any better; it only discards programme
+	/// until the deadline. The floor is the jitter a continuous feed is allowed,
+	/// so it is the room the output needs while it takes over. The cap is at
+	/// least twice the cushion, so a buffer this full is always primed.
 	fn arm(&mut self, now: Instant) {
 		// An aligned leg's clock is started by what it has watched, never by a timer.
 		if self.anchor.is_some() || self.align.is_some() {
@@ -1098,10 +1106,11 @@ impl Scheduler {
 			Some(deadline) => {
 				let primed = self.buffered_packets() as u64 >= self.latency_packets;
 				let settled = !self.profile.bursty() || self.profile.between_deliveries(now);
+				let full = self.buffer.room() <= latency_to_packets(self.latency.floor(), self.mux_rate_bps);
 				let expired = self
 					.first_content_at
 					.is_some_and(|first| now.saturating_duration_since(first) >= deadline);
-				if !((primed && settled) || expired) {
+				if !((primed && settled) || full || expired) {
 					return;
 				}
 				now
@@ -1604,7 +1613,7 @@ fn latency_to_packets(latency: Duration, bitrate: u64) -> usize {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::config::{Config, DEFAULT_LATENCY};
+	use crate::config::{Config, DEFAULT_LATENCY, DEFAULT_LATENCY_CEILING};
 	use crate::error::Error;
 	use crate::pcr::PCR_CLOCK_HZ;
 
@@ -3489,6 +3498,50 @@ mod tests {
 		deliver_segments(&mut sched, t0, Duration::from_secs(2), Duration::from_millis(300), 5);
 		sched.poll_start(t0 + Duration::from_secs(10));
 		assert!(sched.next_due().is_some(), "the clock never started");
+	}
+
+	#[test]
+	fn a_start_that_never_pauses_opens_before_the_buffer_overflows() {
+		// A live export hands over its backlog at once and then streams at the
+		// media rate. The backlog makes the input bursty, so the gate waits for a
+		// pause between deliveries, and a live feed never pauses. Waiting on to
+		// the deadline cannot size the cushion any better: once the buffer is at
+		// its bound, every packet that arrives pushes out the oldest.
+		let mut sched = Scheduler::new(&adaptive_config());
+		let t0 = Instant::now();
+		let slot = Duration::from_secs_f64(1.0 / MUX_PPS);
+		let per_packet = Duration::from_secs_f64(1.0 / MEDIA_PPS);
+		let backlog = MEDIA_PPS as u64;
+		let mut delivered = 0_u64;
+		let mut started = None;
+
+		for output in 0..(12.0 * MUX_PPS) as u64 {
+			let now = t0 + slot.mul_f64(output as f64);
+			while per_packet.mul_f64(delivered.saturating_sub(backlog) as f64) <= now.saturating_duration_since(t0) {
+				let pcr = delivered * (PCR_CLOCK_HZ / MEDIA_PPS as u64);
+				let packet = content_packet(0x100, (delivered % PCR_EVERY == 0).then_some(pcr));
+				sched.enqueue(packet, now);
+				delivered += 1;
+			}
+			if sched.next_due().is_some() {
+				started.get_or_insert(now);
+				sched.emit_datagram(now);
+			}
+		}
+
+		let stats = sched.stats();
+		assert!(stats.arrival_lead_ms > 250, "the backlog did not make the input bursty");
+		assert_eq!(
+			stats.dropped_packets, 0,
+			"the gate held a full buffer and dropped programme (lead {} ms, cushion {} ms)",
+			stats.arrival_lead_ms, stats.latency_target_ms
+		);
+		let started = started.expect("the clock never started");
+		assert!(
+			started.saturating_duration_since(t0) < DEFAULT_LATENCY_CEILING,
+			"the clock waited {:?} for a pause that never came",
+			started.saturating_duration_since(t0)
+		);
 	}
 
 	#[test]
