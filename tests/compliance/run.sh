@@ -18,7 +18,7 @@
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-WORKSPACE=$(cd "$DIR/.." && pwd)
+WORKSPACE=$(cd "$DIR/../.." && pwd)
 COMPLIANCE="$DIR/compliance.py"
 
 SOURCE=""

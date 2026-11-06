@@ -653,16 +653,17 @@ content that never reached the wire.
 
 ## Compliance
 
-`test/` runs a self-contained TSDuck-based compliance harness (PCR accuracy,
-bitrate stability, continuity, PAT/PMT integrity, TR 101 290). It generates or
-takes a `.ts`, paces it through the `cbr_file` example, and asserts the output is
-something a hardware IRD accepts. Run it via:
+`tests/compliance/` runs a self-contained TSDuck-based compliance harness (PCR
+accuracy, bitrate stability, continuity, PAT/PMT integrity, TR 101 290). It
+generates or takes a `.ts`, paces it through the `cbr_file` example, and asserts
+the output is something a hardware IRD accepts. `cargo test` does not run it.
+Run it via:
 
 ```bash
-./test/run.sh                     # generate a clip, pace it, analyze
-./test/run.sh --source cap.ts     # pace a real capture instead
-./test/run.sh --strict            # also fail on broadcast-shape warnings
-./test/run.sh --bursty            # also replay it through the live pacer in segment bursts
+./tests/compliance/run.sh                  # generate a clip, pace it, analyze
+./tests/compliance/run.sh --source cap.ts  # pace a real capture instead
+./tests/compliance/run.sh --strict         # also fail on broadcast-shape warnings
+./tests/compliance/run.sh --bursty         # also replay it through the live pacer in segment bursts
 ```
 
 The `--bursty` arm exists because the rest of the harness structurally cannot test
@@ -673,7 +674,7 @@ the way a segment fetcher delivers it and puts the result through the same
 `pcrverify` gate.
 
 TSDuck (`tsp`, `tsanalyze`) and, for the generated-clip mode, `ffmpeg` must be on
-`PATH`. See [`test/README.md`](test/README.md) for details.
+`PATH`. See [`tests/compliance/README.md`](tests/compliance/README.md) for details.
 
 ## Roadmap
 

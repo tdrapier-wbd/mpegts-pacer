@@ -40,5 +40,5 @@ behaviour at all. Buffer sizing, the start gate and stall detection are function
 (`tsp`) and `ffmpeg` on `PATH`:
 
 ```bash
-./test/run.sh --bursty
+./tests/compliance/run.sh --bursty
 ```

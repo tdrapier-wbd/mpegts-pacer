@@ -1,6 +1,6 @@
 # mpegts-pacer compliance harness
 
-Validates the [`mpegts-pacer`](..) crate's constant-bitrate grooming in
+Validates the [`mpegts-pacer`](../..) crate's constant-bitrate grooming in
 isolation: it shapes a transport stream through the crate's offline CBR example
 (`cargo run -p mpegts-pacer --example cbr_file`) and checks that the paced output
 is something a professional IRD would accept. No relay, no network, so it is fast
