@@ -11,11 +11,12 @@ and deterministic.
 1. **`pcrverify` (headline gate).** A TSDuck `tsp -P pcrverify` pass at a tight
    PCR-accuracy tolerance (default 500 us). Byte-locked CBR output passes; a
    bursty re-mux fails. Any PCR outside tolerance fails the harness.
-2. **Full compliance report.** Runs the vendored [`compliance.py`](compliance.py)
-   with the source as the duration-fidelity reference: PAT/PMT, PSI CRC,
-   continuity, PCR presence/monotonicity, PCR repetition/jitter, null ratio,
-   T-STD, and that the paced clip's duration matches the source (a self-consistent
-   PCR on the wrong rate is caught here).
+2. **Full compliance report.** Runs [`compliance.py`](compliance.py), copied from
+   the moq-dev project under its copyright (see the file's header), with the
+   source as the duration-fidelity reference: PAT/PMT, PSI CRC, continuity, PCR
+   presence/monotonicity, PCR repetition/jitter, null ratio, T-STD, and that the
+   paced clip's duration matches the source (a self-consistent PCR on the wrong
+   rate is caught here).
 
 `[hard]` checks fail the run; `[shape]` checks warn unless `--strict`.
 

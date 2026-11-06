@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Copied from the moq-dev project, test/ts/compliance.py at commit
+# f42bd39d217a4b09ade744a30f0196925245c80a (https://github.com/moq-dev/moq),
+# with only this header added.
+#
+# Copyright (c) 2023 Luke Curley. Used under the MIT License; the permission
+# notice is the one in this repository's LICENSE-MIT.
 """MPEG-TS / IRD compliance analyzer for a captured transport stream.
 
 Given a `.ts` file (typically the output of `moq ... export ts`), this runs the
