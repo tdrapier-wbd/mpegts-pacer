@@ -412,6 +412,16 @@ struct StreamGrid {
 	capacity: usize,
 }
 
+/// Where a leg's output clock stands, in grid slots: the slot it releases next,
+/// where content arriving now belongs at the target latency, and the furthest slot
+/// its buffer may hold.
+#[derive(Clone, Copy)]
+struct Reach {
+	released: u64,
+	live: u64,
+	horizon: u64,
+}
+
 impl StreamGrid {
 	fn new(mux_rate_bps: u64, capacity: usize) -> Self {
 		Self {
@@ -455,7 +465,7 @@ impl StreamGrid {
 	/// grid was built from, so the returning content belongs in the slots its PCR
 	/// says and needs no adjustment, which is how a leg that was cut off for
 	/// twenty seconds comes back into its partner's numbering. So is a jump to a
-	/// slot this leg can still release, at or before `horizon`, the furthest slot
+	/// slot this leg can still release, at or before `reach.horizon`, the furthest slot
 	/// its buffer may hold: a source that froze upstream of the leg hands over the
 	/// last of its old content and the first of the new in one burst, with no
 	/// silence between them, and only a clock that moved puts content further
@@ -471,7 +481,7 @@ impl StreamGrid {
 	///
 	/// Returns the slot and whether it sits beyond the open run because the
 	/// source went quiet, which the caller must not spread that run across.
-	fn slot_for(&mut self, pcr: u64, declared: bool, since: Duration, horizon: Option<u64>) -> (u64, bool) {
+	fn slot_for(&mut self, pcr: u64, declared: bool, since: Duration, reach: Option<Reach>) -> (u64, bool) {
 		let raw = self.map.slot_of_pcr(pcr);
 		let mut after_silence = false;
 		if let Some((open_pcr, open_slot)) = self.open {
@@ -493,14 +503,20 @@ impl StreamGrid {
 			let on_grid = i128::from(raw) + self.epoch;
 			let within_horizon = delta > 0
 				&& on_grid > i128::from(open_slot)
-				&& horizon.is_some_and(|horizon| on_grid <= i128::from(horizon));
+				&& reach.is_some_and(|reach| on_grid <= i128::from(reach.horizon));
 			if (jumped || declared) && !explained_by_silence && (declared || !within_horizon) {
 				// The source clock moved. Continue the grid from where the open run
 				// ends: both legs of a pair compute the same continuation, so an
 				// aligned pair stays aligned — but a leg that joins *after* a splice
 				// cannot know it happened, which is a documented limit of stream
-				// clocking.
+				// clocking. A grid continued past a silence would put the new content in
+				// slots the output has already passed, every packet of it late for good,
+				// so it resumes where live content belongs instead.
 				let resume_at = open_slot.saturating_add(self.run.len().max(1) as u64);
+				let resume_at = match reach {
+					Some(reach) if resume_at < reach.released => reach.live,
+					_ => resume_at,
+				};
 				let epoch = i128::from(resume_at) - i128::from(raw);
 				self.rebased += epoch - self.epoch;
 				self.epoch = epoch;
@@ -517,9 +533,9 @@ impl StreamGrid {
 
 	/// Accept one input packet. Returns the number of packets dropped for want of
 	/// room, so the caller can count them.
-	/// `horizon` is the furthest slot the leg's buffer may hold, once its output
-	/// clock has started; see [`StreamGrid::slot_for`].
-	fn push(&mut self, packet: Packet, now: Instant, horizon: Option<u64>) -> u64 {
+	/// `reach` is where the leg's output clock stands, once it has started; see
+	/// [`StreamGrid::slot_for`].
+	fn push(&mut self, packet: Packet, now: Instant, reach: Option<Reach>) -> u64 {
 		self.note_continuity(&packet);
 		let Some(pcr) = packet.pcr() else {
 			// Before the first PCR there is no grid to place against. Buffering
@@ -535,7 +551,7 @@ impl StreamGrid {
 			.open_at
 			.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
 		let declared = pcr::declares_discontinuity(packet.as_bytes());
-		let (slot, after_silence) = self.slot_for(pcr, declared, since, horizon);
+		let (slot, after_silence) = self.slot_for(pcr, declared, since, reach);
 		let missed = self.run_broken
 			&& self
 				.open
@@ -938,9 +954,13 @@ impl Scheduler {
 		self.resize();
 
 		let started = self.stats.output_packets + self.stats.withheld_packets > 0;
-		let horizon = started.then(|| self.slot.saturating_add(self.max_latency_packets));
+		let reach = started.then(|| Reach {
+			released: self.slot,
+			live: self.slot.saturating_add(self.latency_packets),
+			horizon: self.slot.saturating_add(self.max_latency_packets),
+		});
 		if let Some(grid) = self.grid.as_mut() {
-			let dropped = grid.push(packet, now, horizon);
+			let dropped = grid.push(packet, now, reach);
 			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(dropped);
 			self.stats.pcr_position_overruns = grid.overruns();
 			self.stats.pcr_rebases = grid.rebases();
@@ -2965,6 +2985,41 @@ mod tests {
 			sched.stats().pcr_rebases,
 			1,
 			"the declared step was read as the fetch interval"
+		);
+	}
+
+	#[test]
+	fn a_clock_that_moved_during_a_silence_resumes_where_live_content_belongs() {
+		// A segmented leg's packager withdraws its playlist at a changeover between
+		// two encodes whose clocks are 16,845 s apart, and its receiver rejoins at
+		// the live edge some seconds later. Continued from where the old content
+		// ended, the grid put every packet after the silence in slots the output had
+		// already passed: the leg muted and dropped all of it as late, for good.
+		let cfg = stream_config().with_stall_timeout(Some(Duration::from_millis(200)));
+		let (from, to, runs) = (300, 1_500, 2_400);
+		let stepped = tagged(stream_packets_stepped(runs as u64, to as u64, 2_000_000, false));
+		let gapped: Vec<_> = stepped
+			.into_iter()
+			.enumerate()
+			.filter(|(i, _)| !(from * RUN_LEN..to * RUN_LEN).contains(i))
+			.map(|(_, p)| p)
+			.collect();
+		let (stats, _) = drive_leg(&cfg, &gapped);
+		assert_eq!(stats.pcr_rebases, 1, "the moved clock was not re-based on");
+		assert!(
+			stats.late_drops <= RUN_LEN as u64,
+			"{} packets dropped late after the silence",
+			stats.late_drops
+		);
+		let leg = run_leg(&cfg, &gapped, Instant::now(), &PUNCTUAL, (runs as u64 + 50) * RUN_SLOTS);
+		let after = leg
+			.iter()
+			.filter(|(_, dg)| pid_of(dg) == 0x100 && tag_of(dg) >= to * RUN_LEN)
+			.count();
+		assert!(
+			after + 2 * RUN_LEN >= (runs - to) * RUN_LEN,
+			"{after} of {} packets after the silence went out",
+			(runs - to) * RUN_LEN
 		);
 	}
 
