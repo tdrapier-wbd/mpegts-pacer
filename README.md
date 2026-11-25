@@ -564,7 +564,10 @@ mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
   (`0` disables detection). By default it is the cushion plus one second.
 - `--stall-grace-ms N` -- change that one second.
 - `--on-stall mute|continue|fail` -- what to do then (default `mute`). Transitions
-  are logged to stderr either way.
+  are logged to stderr either way. With `--stream-clock`, a source whose content
+  keeps arriving but late for every slot, so that none has gone out for the same
+  timeout, is behind rather than stalled: `fail` exits, and the other two rejoin
+  the stream where live content belongs, counted in `rejoins`.
 - `--stream-clock` -- place packets by stream position rather than by arrival, so
   two legs are a mergeable pair (see [Clocking](#clocking-whose-clock-decides-what-goes-in-each-slot)).
   Requires an explicit bitrate and an explicit `--latency-ms` or `--segment-ms`.

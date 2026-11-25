@@ -410,6 +410,9 @@ struct StreamGrid {
 	/// worst. See [`Stats::pcr_position_displacement`].
 	displacement_high_water: u64,
 	capacity: usize,
+	/// Set by [`StreamGrid::rejoin`]: the next PCR re-bases the grid onto the
+	/// live slot rather than continuing it.
+	rejoin: bool,
 }
 
 /// Where a leg's output clock stands, in grid slots: the slot it releases next,
@@ -446,7 +449,14 @@ impl StreamGrid {
 			rebases: 0,
 			displacement_high_water: 0,
 			capacity: capacity.max(1),
+			rejoin: false,
 		}
+	}
+
+	/// Re-base on the next PCR where live content belongs. See
+	/// [`SourceState::Behind`].
+	fn rejoin(&mut self) {
+		self.rejoin = true;
 	}
 
 	/// Raise the placement bound to `capacity`, never lowering it. See
@@ -484,6 +494,16 @@ impl StreamGrid {
 	fn slot_for(&mut self, pcr: u64, declared: bool, since: Duration, reach: Option<Reach>) -> (u64, bool) {
 		let raw = self.map.slot_of_pcr(pcr);
 		let mut after_silence = false;
+		if let Some(reach) = reach.filter(|_| self.rejoin) {
+			// Everything open or placed belongs to slots already released; the run
+			// is cut rather than spread, as after a silence.
+			self.rejoin = false;
+			let epoch = i128::from(reach.live) - i128::from(raw);
+			self.rebased += epoch - self.epoch;
+			self.epoch = epoch;
+			self.rebases = self.rebases.saturating_add(1);
+			return (reach.live, self.open.is_some());
+		}
 		if let Some((open_pcr, open_slot)) = self.open {
 			let delta = pcr::forward_delta(open_pcr, pcr);
 			let advanced = pcr::ticks_to_duration(delta);
@@ -778,6 +798,11 @@ impl StreamGrid {
 		self.placed.back().map(|(slot, _)| *slot)
 	}
 
+	/// The slot of the open run's PCR, the latest the source has asked for.
+	fn open_slot(&self) -> Option<u64> {
+		self.open.map(|(_, slot)| slot)
+	}
+
 	/// Whether any content is placed and still to be transmitted.
 	///
 	/// The run still accumulating does not count. It cannot be placed until its
@@ -864,6 +889,13 @@ pub struct Scheduler {
 	last_content_at: Option<Instant>,
 	/// Whether the input was stalled as of the last output slot.
 	stalled: bool,
+	/// Wall time a datagram last carried content to the wire, and the late-drop
+	/// count then: what [`SourceState::Behind`] is measured from.
+	sent_content_at: Option<Instant>,
+	late_drops_at_send: u64,
+	/// Whether the latest PCR to arrive was for a slot not yet released: a leg
+	/// whose input is on time is waiting on early content, not behind.
+	arrived_on_time: bool,
 	scratch: Vec<u8>,
 	stats: Stats,
 }
@@ -919,6 +951,9 @@ impl Scheduler {
 			first_content_at: None,
 			last_content_at: None,
 			stalled: false,
+			sent_content_at: None,
+			late_drops_at_send: 0,
+			arrived_on_time: false,
 			scratch: Vec::with_capacity(config.packets_per_datagram.max(1) * TS_PACKET_SIZE),
 			stats: Stats::default(),
 		}
@@ -960,7 +995,11 @@ impl Scheduler {
 			horizon: self.slot.saturating_add(self.max_latency_packets),
 		});
 		if let Some(grid) = self.grid.as_mut() {
+			let has_pcr = packet.has_pcr();
 			let dropped = grid.push(packet, now, reach);
+			if has_pcr && reach.is_some() {
+				self.arrived_on_time = grid.open_slot().is_some_and(|slot| slot >= self.slot);
+			}
 			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(dropped);
 			self.stats.pcr_position_overruns = grid.overruns();
 			self.stats.pcr_rebases = grid.rebases();
@@ -1228,6 +1267,9 @@ impl Scheduler {
 		// is spent. It is also what keeps an offline run, where packets are handed
 		// over on a synthetic clock and the file simply ends, from reading as a
 		// stall while it flushes its tail.
+		if self.is_behind(now) {
+			return SourceState::Behind;
+		}
 		if self.has_pending() {
 			return SourceState::Live;
 		}
@@ -1399,6 +1441,10 @@ impl Scheduler {
 	/// byte clock advances all the same. See [`Stats::withheld_packets`].
 	pub fn emit_datagram(&mut self, now: Instant) -> &[u8] {
 		self.catch_up(now);
+		if self.is_behind(now) {
+			self.rejoin(now);
+		}
+		let content_before = self.stats.content_packets;
 		self.scratch.clear();
 		// The cushion in *content* packets, not carrier packets: the buffer holds
 		// media, and at 11 Mb/s of carrier over 9.4 Mb/s of content the two differ
@@ -1496,7 +1542,55 @@ impl Scheduler {
 			self.scratch.clear();
 			self.stats.withheld_packets = self.stats.withheld_packets.saturating_add(packets);
 		}
+		if self.stats.content_packets > content_before {
+			self.sent_content_at = Some(now);
+			self.late_drops_at_send = self.stats.late_drops;
+		}
 		&self.scratch
+	}
+
+	/// Whether a stream-clocked leg has fallen behind its own slots: content is
+	/// arriving, the latest PCR was for a slot already released, packets are being
+	/// dropped late, and none has gone out for the stall timeout. See
+	/// [`SourceState::Behind`].
+	///
+	/// Arrival on time is what tells this from a leg holding early content, which
+	/// also sends no content while its input is busy, and may still be dropping
+	/// the stale tail of a burst that came before it.
+	fn is_behind(&self, now: Instant) -> bool {
+		let (Some(timeout), Some(since)) = (self.stall_timeout(), self.sent_content_at.or(self.anchor)) else {
+			return false;
+		};
+		self.grid.is_some()
+			&& !self.arrived_on_time
+			&& self.last_content_at.is_some()
+			&& self.silent_for(now) < timeout
+			&& self.stats.late_drops > self.late_drops_at_send
+			&& now.saturating_duration_since(since) >= timeout
+	}
+
+	/// Move a leg that fell behind to where live content belongs, as
+	/// [`StreamGrid::slot_for`] does for a clock that moved during a silence: the
+	/// output clock cannot run backwards, so the grid moves forward instead.
+	fn rejoin(&mut self, now: Instant) {
+		if let Some(grid) = self.grid.as_mut() {
+			grid.rejoin();
+		}
+		self.stats.late_drops = self.stats.late_drops.saturating_add(self.deferred.len() as u64);
+		self.deferred.clear();
+		self.phased = false;
+		self.sent_content_at = Some(now);
+		self.late_drops_at_send = self.stats.late_drops;
+		self.arrived_on_time = false;
+		self.stats.rejoins = self.stats.rejoins.saturating_add(1);
+	}
+
+	/// How long a stream-clocked leg has sent no content, for
+	/// [`Error::SourceBehind`](crate::Error::SourceBehind).
+	pub fn unsent_for(&self, now: Instant) -> Duration {
+		self.sent_content_at
+			.or(self.anchor)
+			.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
 	}
 
 	/// Move at most one packet from the input side into the emission queue.
@@ -3021,6 +3115,71 @@ mod tests {
 			"{after} of {} packets after the silence went out",
 			(runs - to) * RUN_LEN
 		);
+	}
+
+	#[test]
+	fn a_source_that_falls_behind_its_slots_rejoins_where_live_content_belongs() {
+		// An exporter slows to half the stream's rate for half a second and then
+		// delivers at full rate again, that much behind. Its content never stops
+		// arriving, so no stall is declared, but every packet lands in a slot the
+		// output has already passed: the leg withheld every slot and dropped all of
+		// it as late, for good, while reporting itself live.
+		let cfg = stream_config().with_stall_timeout(Some(Duration::from_millis(200)));
+		let (from, to, runs) = (600, 700, 2_000);
+		let stream = tagged(stream_packets(runs));
+		let (start, lag) = (
+			stream[from * RUN_LEN].1,
+			stream[to * RUN_LEN].1 - stream[from * RUN_LEN].1,
+		);
+		let behind: Vec<_> = stream
+			.into_iter()
+			.enumerate()
+			.map(|(i, (packet, at))| match i / RUN_LEN {
+				run if run < from => (packet, at),
+				run if run < to => (packet, at + (at - start)),
+				_ => (packet, at + lag),
+			})
+			.collect();
+		let leg = run_leg(
+			&cfg,
+			&behind,
+			Instant::now(),
+			&PUNCTUAL,
+			(runs as u64 + 200) * RUN_SLOTS,
+		);
+		let settled = to + 200;
+		let after = leg
+			.iter()
+			.flat_map(|(_, dg)| dg.chunks_exact(TS_PACKET_SIZE))
+			.filter(|p| pid_of(p) == 0x100 && tag_of(p) >= settled * RUN_LEN)
+			.count();
+		assert!(
+			after + 2 * RUN_LEN >= (runs - settled) * RUN_LEN,
+			"{after} of {} packets went out once the source was streaming again",
+			(runs - settled) * RUN_LEN
+		);
+		// While the source is slower than its clock it falls behind again after each
+		// rejoin, about once a stall timeout across the second it is slow, and not
+		// at all once it streams again.
+		let (stats, _) = drive_leg(&cfg, &behind);
+		assert!((1..=6).contains(&stats.rejoins), "{} rejoins", stats.rejoins);
+	}
+
+	#[test]
+	fn content_held_early_inside_the_horizon_is_not_a_leg_behind() {
+		// A leg whose content sits ahead of the output clock sends stuffing while
+		// it waits, with content arriving all the while. That is a leg ahead, which
+		// the horizon already allows for, and must not read as one that fell behind.
+		let cfg = stream_config()
+			.with_stall_timeout(Some(Duration::from_millis(200)))
+			.with_max_latency(Duration::from_secs(2));
+		let (stats, _) = drive_leg(&cfg, &stream_packets_stepped(1_200, 600, 200, false));
+		assert_eq!(
+			(stats.pcr_rebases, stats.late_drops),
+			(0, 0),
+			"the step was not held as early content"
+		);
+		assert_eq!(stats.rejoins, 0, "a leg holding early content was moved");
 	}
 
 	#[test]

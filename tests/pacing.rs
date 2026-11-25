@@ -551,6 +551,59 @@ async fn stalled_source_fails_under_the_fail_policy() {
 	}
 }
 
+/// A source that delivers each packet at its media time until `from`, then at
+/// half the stream's rate: an exporter falling behind its own clock while it
+/// still delivers.
+struct SlowingSource {
+	packets: std::vec::IntoIter<Packet>,
+	ticks_per_packet: u64,
+	from: u64,
+	sent: u64,
+	started: Option<tokio::time::Instant>,
+}
+
+impl mpegts_pacer::Source for SlowingSource {
+	async fn recv(&mut self) -> Result<Option<Packet>> {
+		let started = *self.started.get_or_insert_with(tokio::time::Instant::now);
+		let media = |index: u64| Duration::from_nanos(index * self.ticks_per_packet * 1_000 / 27);
+		let due = match self.sent.checked_sub(self.from) {
+			None => media(self.sent),
+			Some(slow) => media(self.from) + media(slow) * 2,
+		};
+		tokio::time::sleep_until(started + due).await;
+		self.sent += 1;
+		Ok(self.packets.next())
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_clocked_leg_behind_its_slots_fails_under_the_fail_policy() {
+	// Its content never stops, so no stall is declared; every packet is late for
+	// its slot, so none goes out. A supervisor told to restart on a dead source
+	// has to hear about this one too.
+	let config = Config::new(MUX_RATE)
+		.with_latency(Duration::from_millis(50))
+		.with_clocking(Clocking::Stream)
+		.with_stall_timeout(Some(Duration::from_millis(200)))
+		.with_stall_policy(StallPolicy::Fail);
+	let source = SlowingSource {
+		packets: media_stream(20_000, 5_000_000, 7).into_iter(),
+		ticks_per_packet: (TS_PACKET_SIZE as u64 * 8 * 27_000_000) / 5_000_000,
+		from: 3_000,
+		sent: 0,
+		started: None,
+	};
+	let error = pace(config, source, CollectSink(Arc::new(Mutex::new(Vec::new()))))
+		.await
+		.expect_err("a leg behind its slots must surface to the supervisor");
+	match error {
+		Error::SourceBehind { unsent_for } => {
+			assert!(unsent_for >= Duration::from_millis(200), "reported {unsent_for:?}");
+		}
+		other => panic!("expected SourceBehind, got {other:?}"),
+	}
+}
+
 #[tokio::test(start_paused = true)]
 async fn carrier_resumes_when_content_returns() {
 	// One continuous stream split across a 2 s outage, so the returning packets

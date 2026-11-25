@@ -403,6 +403,10 @@ fn liveness(interval: Option<Duration>) -> CallbackObserver<impl FnMut(Health) +
 				"mpegts-pacer: SOURCE STALLED (stall #{}, {} ms without content)",
 				health.stats.stalls, health.stats.content_gap_max_ms,
 			),
+			SourceState::Behind => eprintln!(
+				"mpegts-pacer: SOURCE BEHIND (content arriving, every packet late for its slot; rejoin #{})",
+				health.stats.rejoins + 1,
+			),
 			// The cushion it settled on is worth saying out loud the moment it
 			// starts: on a segmented input it is the difference between a groomer
 			// that works and one that mutes every two seconds.
@@ -423,7 +427,7 @@ fn sample(elapsed: Duration, health: &Health) {
 	let s = &health.stats;
 	eprintln!(
 		"mpegts-pacer: sample t={} state={:?} out={} content={} null={} stuffing={:.3} \
-		 dropped={} late_drops={} underruns={} stalls={} muted={} resyncs={} pcr_inserted={} \
+		 dropped={} late_drops={} underruns={} stalls={} muted={} resyncs={} rejoins={} pcr_inserted={} \
 		 buffer={} buffer_high_water={} cushion_ms={} lead_ms={} media_rate_bps={} \
 		 content_gap_max_ms={} pcr_displacement={} rate_dpkts={:.1} rate_dsecs={:.6} \
 		 rate_intervals={} rate_pcrs={} pcr_rebases={} rate_max_pkts={} rate_subms={} clock_stalled={} rate_pending={} \
@@ -440,6 +444,7 @@ fn sample(elapsed: Duration, health: &Health) {
 		s.stalls,
 		s.muted_packets,
 		s.resyncs,
+		s.rejoins,
 		s.pcr_inserted,
 		s.buffer_packets,
 		s.buffer_high_water,
@@ -466,7 +471,7 @@ fn sample(elapsed: Duration, health: &Health) {
 fn report(stats: &Stats) {
 	eprintln!(
 		"mpegts-pacer: done. output_packets={} content={} null={} ({:.1}% stuffing) \
-		 pcr_inserted={} stripped_nulls={} dropped={} late_drops={} resyncs={} start_backlog={} underruns={} \
+		 pcr_inserted={} stripped_nulls={} dropped={} late_drops={} resyncs={} rejoins={} start_backlog={} underruns={} \
 		 withheld={} cut_runs={} stalls={} muted={} max_content_gap={} ms align_gain_us={}",
 		stats.output_packets,
 		stats.content_packets,
@@ -477,6 +482,7 @@ fn report(stats: &Stats) {
 		stats.dropped_packets,
 		stats.late_drops,
 		stats.resyncs,
+		stats.rejoins,
 		stats.start_backlog,
 		stats.underruns,
 		stats.withheld_packets,

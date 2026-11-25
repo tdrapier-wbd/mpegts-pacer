@@ -162,6 +162,13 @@ where
 				// of several seconds the drain outlasts the stall timeout, so
 				// applying the policy here would discard the tail of the stream.
 				let stalled = state == SourceState::Stalled && !closing;
+				// A leg behind its slots rejoins inside the scheduler; only a run
+				// told to fail on a dead source ends here, so whatever supervises it
+				// restarts the source that fell behind.
+				if state == SourceState::Behind && config.stall_policy == StallPolicy::Fail {
+					reporter.force(&mut observer, &scheduler, now);
+					return Err(Error::SourceBehind { unsent_for: scheduler.unsent_for(now) });
+				}
 				match (stalled, config.stall_policy) {
 					// The source is gone, not late. Hold the byte clock but put
 					// nothing on the wire, so downstream sees the carrier stop

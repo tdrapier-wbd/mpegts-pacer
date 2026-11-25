@@ -78,6 +78,15 @@ pub struct Stats {
 	/// the path is delivering faster than the mux rate for long enough to build
 	/// a buffer, i.e. the configured rate is below the content rate.
 	pub resyncs: u64,
+	/// Times a leg under [`Clocking::Stream`](crate::Clocking) whose content kept
+	/// arriving but had sent none of it for the stall timeout, every packet late
+	/// for its slot, moved its grid to where live content belongs. See
+	/// [`SourceState::Behind`](crate::SourceState::Behind).
+	///
+	/// The output clock cannot run backwards, so without this a source that falls
+	/// behind by more than the cushion is dropped as late for good. A count that
+	/// keeps climbing is a source delivering slower than its own clock.
+	pub rejoins: u64,
 	/// Stream in hand when the output clock started, in 188-byte packets at the
 	/// mux rate — the depth of the backlog a leg was handed as it joined.
 	///

@@ -37,6 +37,17 @@ pub enum Error {
 		silent_for: Duration,
 	},
 
+	/// A stream-clocked leg's content kept arriving, every packet of it too late
+	/// for its slot, and none was sent for longer than
+	/// [`Config::stall`](crate::Config::stall), under
+	/// [`StallPolicy::Fail`](crate::StallPolicy::Fail). See
+	/// [`SourceState::Behind`](crate::SourceState::Behind).
+	#[error("source behind: content arriving but none sent for {unsent_for:?}, every packet late")]
+	SourceBehind {
+		/// How long the leg had sent no content when the pacer gave up.
+		unsent_for: Duration,
+	},
+
 	/// The source's PCR byte positions do not advance with its PCR values, by
 	/// more than the buffer can absorb, under
 	/// [`PcrPositionPolicy::Fail`](crate::PcrPositionPolicy::Fail).

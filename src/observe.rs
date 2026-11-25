@@ -39,6 +39,18 @@ pub enum SourceState {
 	/// treated as gone rather than late, and
 	/// [`Config::stall_policy`](crate::Config::stall_policy) applies.
 	Stalled,
+
+	/// Under [`Clocking::Stream`](crate::Clocking): content is still arriving, but
+	/// every packet lands in a slot the output has already passed, and none has
+	/// been sent for longer than the stall timeout. The source fell further behind
+	/// its own clock than the cushion holds.
+	///
+	/// No arrival-based reading sees this — the input is busy — so a leg left to
+	/// it would carry silence for good while reporting itself live. The leg
+	/// rejoins where live content belongs (see
+	/// [`Stats::rejoins`](crate::Stats::rejoins)), unless
+	/// [`StallPolicy::Fail`](crate::StallPolicy::Fail) ends the run instead.
+	Behind,
 }
 
 impl SourceState {
