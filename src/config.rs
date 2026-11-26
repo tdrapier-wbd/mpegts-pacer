@@ -289,6 +289,14 @@ pub struct Config {
 	/// See [`StallPolicy`].
 	pub stall_policy: StallPolicy,
 
+	/// How long after the run starts [`StallPolicy::Fail`] waits before it ends
+	/// the run, muting a stall or a leg behind in the meantime as
+	/// [`StallPolicy::Mute`] would. A source that has only just been started
+	/// pauses as it connects and catches up to its live edge; a supervisor that
+	/// restarts on failure would otherwise kill every start on that pause. A
+	/// source that never speaks still fails, once the grace has passed.
+	pub start_grace: Duration,
+
 	/// What decides which packet occupies each output slot. See [`Clocking`].
 	pub clocking: Clocking,
 
@@ -358,6 +366,9 @@ pub const DEFAULT_PCR_MAX_INTERVAL: Duration = Duration::from_millis(40);
 /// meant to absorb, while still declaring a dead source inside the window an IRD
 /// input-failover would notice.
 pub const DEFAULT_STALL_GRACE: Duration = Duration::from_secs(1);
+/// Default [`Config::start_grace`]: several times the second or two a live
+/// exporter takes to connect and reach its live edge.
+pub const DEFAULT_START_GRACE: Duration = Duration::from_secs(10);
 /// Default headroom for [`Bitrate::Auto`]: 15% above the measured content rate.
 pub const DEFAULT_AUTO_HEADROOM: f64 = 0.15;
 /// Fallback output rate for [`Bitrate::Auto`] when the source carries no usable
@@ -466,6 +477,7 @@ impl Config {
 			pcr_max_interval: DEFAULT_PCR_MAX_INTERVAL,
 			stall: Stall::default(),
 			stall_policy: StallPolicy::default(),
+			start_grace: DEFAULT_START_GRACE,
 			clocking: Clocking::default(),
 			sequence_seed: 0,
 			pcr_position_policy: PcrPositionPolicy::default(),
@@ -572,6 +584,12 @@ impl Config {
 	/// Set what happens once the input is stalled. See [`StallPolicy`].
 	pub fn with_stall_policy(mut self, policy: StallPolicy) -> Self {
 		self.stall_policy = policy;
+		self
+	}
+
+	/// Set how long after the start a failing policy waits. See [`Config::start_grace`].
+	pub fn with_start_grace(mut self, grace: Duration) -> Self {
+		self.start_grace = grace;
 		self
 	}
 

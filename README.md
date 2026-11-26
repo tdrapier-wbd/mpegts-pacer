@@ -540,6 +540,7 @@ Arguments (`mpegts-pacer --help`):
 mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
              [--segment-ms N] [--latency-ms N] [--max-latency-ms N] [--latency-ceiling-ms N]
              [--ssrc N] [--stall-ms N] [--stall-grace-ms N] [--on-stall mute|continue|fail]
+             [--start-grace-ms N]
              [--stream-clock] [--sequence-seed N] [--align-ms N] [--require-pcr-position]
              [--track-clock]
 ```
@@ -569,6 +570,10 @@ mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
   keeps arriving but late for every slot, so that none has gone out for the same
   timeout, is behind rather than stalled: `fail` exits, and the other two rejoin
   the stream where live content belongs, counted in `rejoins`.
+- `--start-grace-ms N` -- how long after the start `fail` mutes instead of
+  exiting (default 10000). A source just started pauses as it connects and
+  reaches its live edge; restarted on every exit, a run that failed on that pause
+  would never get going. A source that never speaks still fails once it passes.
 - `--stream-clock` -- place packets by stream position rather than by arrival, so
   two legs are a mergeable pair (see [Clocking](#clocking-whose-clock-decides-what-goes-in-each-slot)).
   Requires an explicit bitrate and an explicit `--latency-ms` or `--segment-ms`.

@@ -133,7 +133,7 @@ where
 					} else {
 						silent
 					};
-					if stalls_hard(&config) && scheduler.stall_timeout().is_some_and(|t| silent >= t) {
+					if stalls_hard(&config, started_at, now) && scheduler.stall_timeout().is_some_and(|t| silent >= t) {
 						return Err(Error::SourceStalled { silent_for: silent });
 					}
 				}
@@ -162,14 +162,15 @@ where
 				// of several seconds the drain outlasts the stall timeout, so
 				// applying the policy here would discard the tail of the stream.
 				let stalled = state == SourceState::Stalled && !closing;
+				let policy = policy_at(&config, started_at, now);
 				// A leg behind its slots rejoins inside the scheduler; only a run
 				// told to fail on a dead source ends here, so whatever supervises it
 				// restarts the source that fell behind.
-				if state == SourceState::Behind && config.stall_policy == StallPolicy::Fail {
+				if state == SourceState::Behind && policy == StallPolicy::Fail {
 					reporter.force(&mut observer, &scheduler, now);
 					return Err(Error::SourceBehind { unsent_for: scheduler.unsent_for(now) });
 				}
-				match (stalled, config.stall_policy) {
+				match (stalled, policy) {
 					// The source is gone, not late. Hold the byte clock but put
 					// nothing on the wire, so downstream sees the carrier stop
 					// instead of a programme-free stream it will read as healthy.
@@ -258,9 +259,18 @@ fn wait_budget(config: &Config) -> Duration {
 		.unwrap_or(IDLE_POLL)
 }
 
-/// Whether a stall should end the run with [`Error::SourceStalled`].
-fn stalls_hard(config: &Config) -> bool {
-	config.stall != Stall::Off && config.stall_policy == StallPolicy::Fail
+/// The stall policy in force at `now` for a run that started at `started_at`:
+/// [`StallPolicy::Fail`] mutes until [`Config::start_grace`] has passed.
+fn policy_at(config: &Config, started_at: Instant, now: Instant) -> StallPolicy {
+	match config.stall_policy {
+		StallPolicy::Fail if now.saturating_duration_since(started_at) < config.start_grace => StallPolicy::Mute,
+		policy => policy,
+	}
+}
+
+/// Whether a stall at `now` should end the run with [`Error::SourceStalled`].
+fn stalls_hard(config: &Config, started_at: Instant, now: Instant) -> bool {
+	config.stall != Stall::Off && policy_at(config, started_at, now) == StallPolicy::Fail
 }
 
 /// Rate-limits health reporting to transitions plus a slow heartbeat.
@@ -329,9 +339,10 @@ async fn resolve_auto<Src: Source>(source: &mut Src, headroom: f64, config: &Con
 			// Exhausted: resolve from whatever we gathered.
 			Arrival::Eof => break,
 			Arrival::Silent => {
-				if stalls_hard(config) {
+				let now = tokio_instant::now_std();
+				if stalls_hard(config, started_at, now) {
 					return Err(Error::SourceStalled {
-						silent_for: tokio_instant::now_std().saturating_duration_since(started_at),
+						silent_for: now.saturating_duration_since(started_at),
 					});
 				}
 				// Two PCRs is a measurable window; below that, keep waiting rather

@@ -62,6 +62,7 @@ Reads a transport stream on stdin and writes it out at a constant bitrate.
                            0 disables stall detection entirely
   --stall-grace-ms N       grace on top of an adaptively sized cushion
   --on-stall POLICY        mute, continue or fail
+  --start-grace-ms N       how long after the start fail mutes instead (10000)
 
   --stream-clock           place packets by stream position, for an ST 2022-7 pair
   --sequence-seed N        first RTP sequence number, for a stream-clocked pair
@@ -158,6 +159,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	let mut stall_timeout = None;
 	let mut stall_grace = None;
 	let mut stall_policy = None;
+	let mut start_grace = None;
 	let mut clocking = Clocking::Arrival;
 	let mut sequence_seed = 0;
 	let mut align = None;
@@ -186,6 +188,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 				stall_timeout = Some((!ms.is_zero()).then_some(ms));
 			}
 			"--stall-grace-ms" => stall_grace = Some(millis(args, &mut at, "--stall-grace-ms")?),
+			"--start-grace-ms" => start_grace = Some(millis(args, &mut at, "--start-grace-ms")?),
 			"--on-stall" => {
 				stall_policy = Some(match value(args, &mut at, "--on-stall")?.as_str() {
 					"mute" => StallPolicy::Mute,
@@ -258,6 +261,9 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	}
 	if let Some(grace) = stall_grace {
 		config = config.with_stall_grace(grace);
+	}
+	if let Some(grace) = start_grace {
+		config = config.with_start_grace(grace);
 	}
 	if let Some(policy) = stall_policy {
 		config = config.with_stall_policy(policy);

@@ -530,7 +530,8 @@ async fn stalled_source_fails_under_the_fail_policy() {
 	let config = Config::new(MUX_RATE)
 		.with_latency(Duration::from_millis(50))
 		.with_stall_timeout(Some(Duration::from_millis(500)))
-		.with_stall_policy(StallPolicy::Fail);
+		.with_stall_policy(StallPolicy::Fail)
+		.with_start_grace(Duration::ZERO);
 
 	let error = pace(
 		config,
@@ -547,6 +548,74 @@ async fn stalled_source_fails_under_the_fail_policy() {
 				"reported silence {silent_for:?}"
 			);
 		}
+		other => panic!("expected SourceStalled, got {other:?}"),
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gap_inside_the_start_grace_is_muted_rather_than_failed() {
+	// A freshly started exporter delivers its backlog, pauses on the way to its
+	// live edge, then delivers steadily. Restarted on every failure, a run that
+	// failed on that pause would never get going.
+	let stream = media_stream(1400, 5_000_000, 7);
+	let (first, second) = stream.split_at(700);
+	let config = |grace| {
+		Config::new(MUX_RATE)
+			.with_latency(Duration::from_millis(50))
+			.with_stall_timeout(Some(Duration::from_millis(500)))
+			.with_stall_policy(StallPolicy::Fail)
+			.with_start_grace(grace)
+	};
+	let source = || StallingSource::resuming(first.to_vec(), Duration::from_secs(2), second.to_vec());
+
+	let early = pace(
+		config(Duration::ZERO),
+		source(),
+		CollectSink(Arc::new(Mutex::new(Vec::new()))),
+	);
+	assert!(
+		matches!(early.await, Err(Error::SourceStalled { .. })),
+		"without a grace the pause ends the run"
+	);
+
+	let sent: Timeline = Arc::new(Mutex::new(Vec::new()));
+	let graced = tokio::time::timeout(
+		Duration::from_secs(6),
+		pace(
+			config(Duration::from_secs(10)),
+			source(),
+			StampedSink::new(sent.clone()),
+		),
+	);
+	assert!(graced.await.is_err(), "the run ended inside its start grace");
+	let sent = sent.lock().unwrap().clone();
+	let content = sent
+		.iter()
+		.flat_map(|(_, datagram)| datagram.chunks_exact(TS_PACKET_SIZE))
+		.filter(|packet| pid(packet) == MEDIA_PID && !carries_pcr(packet))
+		.count();
+	assert!(content > 700, "content resumed after the pause, only {content} packets");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_source_that_never_speaks_fails_once_the_start_grace_has_passed() {
+	let config = Config::new(MUX_RATE)
+		.with_latency(Duration::from_millis(50))
+		.with_stall_timeout(Some(Duration::from_millis(500)))
+		.with_stall_policy(StallPolicy::Fail)
+		.with_start_grace(Duration::from_secs(3));
+	let error = pace(
+		config,
+		StallingSource::silent_after(Vec::new()),
+		CollectSink(Arc::new(Mutex::new(Vec::new()))),
+	)
+	.await
+	.expect_err("a dead source must still surface to the supervisor");
+	match error {
+		Error::SourceStalled { silent_for } => assert!(
+			(Duration::from_secs(3)..Duration::from_secs(4)).contains(&silent_for),
+			"reported silence {silent_for:?}"
+		),
 		other => panic!("expected SourceStalled, got {other:?}"),
 	}
 }
@@ -585,7 +654,8 @@ async fn a_stream_clocked_leg_behind_its_slots_fails_under_the_fail_policy() {
 		.with_latency(Duration::from_millis(50))
 		.with_clocking(Clocking::Stream)
 		.with_stall_timeout(Some(Duration::from_millis(200)))
-		.with_stall_policy(StallPolicy::Fail);
+		.with_stall_policy(StallPolicy::Fail)
+		.with_start_grace(Duration::ZERO);
 	let source = SlowingSource {
 		packets: media_stream(20_000, 5_000_000, 7).into_iter(),
 		ticks_per_packet: (TS_PACKET_SIZE as u64 * 8 * 27_000_000) / 5_000_000,
