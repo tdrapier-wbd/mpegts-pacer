@@ -101,8 +101,8 @@ const TRACK_WINDOW: Duration = Duration::from_secs(30);
 /// How hard [`ClockTrack`] closes on the source's clock: the trim it asks for is
 /// the margin's departure from where the leg started, as a rate over this many
 /// seconds. Long, so the trim is a property of the clock and not of one window's
-/// deliveries; at the 13.5 ppm a live source was measured at, it holds the
-/// margin about 25 ms short of where it started.
+/// deliveries; a source 13.5 ppm slow is held about 25 ms short of where the
+/// margin started.
 const TRACK_TIME_CONSTANT: f64 = 1_800.0;
 
 /// The most [`ClockTrack`] trims the release rate. A conformant source's system
@@ -844,8 +844,7 @@ impl StreamGrid {
 /// then delivers every slot a little later, relative to its release, than the
 /// one before, and the cushion drains at that rate: at 13.5 ppm a one-second
 /// cushion is gone in about a day, and from then on each slot is released before
-/// its content arrives. Nothing upstream is at fault, and a restart cures it by
-/// starting a fresh margin, which is what makes it look like a fault upstream.
+/// its content arrives.
 ///
 /// So the leg measures how far ahead of its due time each PCR arrives, keeps the
 /// least of these over a window — the latest delivery, which is the margin that
@@ -957,8 +956,9 @@ pub struct Scheduler {
 	/// Where the release clock runs from once [`ClockTrack`] has trimmed it:
 	/// the wall time a slot was due and the slot. `None` runs it from the anchor.
 	clock: Option<(Instant, u64)>,
-	/// Keeps a stream-clocked leg's release rate on its source's clock.
-	track: ClockTrack,
+	/// Trims a stream-clocked leg's release rate to its source's delivery;
+	/// `None` unless [`Config::track_clock`].
+	track: Option<ClockTrack>,
 	/// Position of the next output packet: a running count under
 	/// [`Clocking::Arrival`], an absolute grid index under [`Clocking::Stream`].
 	slot: u64,
@@ -1054,7 +1054,7 @@ impl Scheduler {
 			anchor: None,
 			anchor_slot: 0,
 			clock: None,
-			track: ClockTrack::new(),
+			track: config.track_clock.then(ClockTrack::new),
 			slot: 0,
 			grid: (config.clocking == Clocking::Stream).then(|| StreamGrid::new(bitrate, capacity)),
 			phased: false,
@@ -1478,10 +1478,9 @@ impl Scheduler {
 			.clock
 			.or_else(|| self.anchor.map(|anchor| (anchor, self.anchor_slot)))?;
 		let nominal = self.packets_to_duration(slot.abs_diff(from));
-		let span = if self.track.trim == 0.0 {
-			nominal
-		} else {
-			nominal.div_f64(1.0 + self.track.trim)
+		let span = match self.track.as_ref().map_or(0.0, |track| track.trim) {
+			0.0 => nominal,
+			trim => nominal.div_f64(1.0 + trim),
 		};
 		if slot >= from {
 			Some(at + span)
@@ -1494,7 +1493,10 @@ impl Scheduler {
 	/// [`ClockTrack`] asks for a new trim, restart the release clock from the
 	/// current slot at the new rate, so no slot already due moves.
 	fn track_clock(&mut self, slot: u64, now: Instant) {
-		let Some(due) = self.due_of(slot) else {
+		if self.track.is_none() {
+			return;
+		}
+		let (Some(due), release) = (self.due_of(slot), self.due_of(self.slot)) else {
 			return;
 		};
 		let lead = match due.checked_duration_since(now) {
@@ -1509,9 +1511,12 @@ impl Scheduler {
 		]
 		.iter()
 		.fold(0_u64, |sum, count| sum.saturating_add(*count));
-		if let Some(trim) = self.track.observe(now, lead, epoch) {
-			self.clock = self.due_of(self.slot).map(|at| (at, self.slot));
-			self.track.trim = trim;
+		let Some(track) = self.track.as_mut() else {
+			return;
+		};
+		if let Some(trim) = track.observe(now, lead, epoch) {
+			track.trim = trim;
+			self.clock = release.map(|at| (at, self.slot));
 			self.stats.clock_trim_ppb = (trim * 1e9).round() as i64;
 		}
 	}
@@ -2785,13 +2790,15 @@ mod tests {
 	/// Feed `stream` to one stream-clocked leg on time and emit until it is all in;
 	/// return the counters and what was withheld after the first datagram went out.
 	fn drive_leg(cfg: &Config, stream: &[(Packet, Duration)]) -> (Stats, u64) {
-		drive_leg_tracking(cfg, stream, ClockTrack::new())
+		drive_leg_tracking(cfg, stream, None)
 	}
 
-	/// [`drive_leg`], with the leg's clock tracking set to `track`.
-	fn drive_leg_tracking(cfg: &Config, stream: &[(Packet, Duration)], track: ClockTrack) -> (Stats, u64) {
+	/// [`drive_leg`], with the leg's clock tracking replaced by `track` if given.
+	fn drive_leg_tracking(cfg: &Config, stream: &[(Packet, Duration)], track: Option<ClockTrack>) -> (Stats, u64) {
 		let mut sched = Scheduler::new(cfg);
-		sched.track = track;
+		if track.is_some() {
+			sched.track = track;
+		}
 		let t0 = Instant::now();
 		let (mut next, mut withheld_at_start) = (0, None);
 		while next < stream.len() {
@@ -3400,9 +3407,13 @@ mod tests {
 			max_step: 5e-4,
 			..ClockTrack::new()
 		};
-		let (untrimmed, _) = drive_leg_tracking(&cfg, &stream, tracker(0.0));
+		let (untrimmed, _) = drive_leg_tracking(&cfg, &stream, Some(tracker(0.0)));
 		assert!(untrimmed.rejoins > 0, "the drift never drained the cushion");
-		let (trimmed, _) = drive_leg_tracking(&cfg, &stream, tracker(2e-2));
+		let (default, _) = drive_leg(&cfg, &stream);
+		assert_eq!(default.clock_trim_ppb, 0, "the leg tracked without --track-clock");
+		assert!(default.rejoins > 0, "the default leg never fell behind");
+		assert!(Scheduler::new(&cfg.with_clock_tracking(true)).track.is_some());
+		let (trimmed, _) = drive_leg_tracking(&cfg, &stream, Some(tracker(2e-2)));
 		assert_eq!(trimmed.rejoins, 0, "the trimmed leg still fell behind");
 		assert!(trimmed.late_drops < 50, "{} packets late", trimmed.late_drops);
 		assert!(

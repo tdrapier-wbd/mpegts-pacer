@@ -69,6 +69,8 @@ Reads a transport stream on stdin and writes it out at a constant bitrate.
                            leg, and start in phase with its fastest delivery
   --require-pcr-position   fail if the source's PCR byte positions do not track
                            its PCR values by more than the buffer can absorb
+  --track-clock            trim a stream-clocked leg's release rate to its
+                           source's delivery (experimental)
 
   --stats-interval-ms N    emit a machine-readable counter line to stderr every
                            N ms, for a run long enough that the closing report
@@ -160,6 +162,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	let mut sequence_seed = 0;
 	let mut align = None;
 	let mut pcr_position_policy = PcrPositionPolicy::default();
+	let mut track_clock = false;
 	let mut stats_interval = None;
 
 	let mut at = 2;
@@ -206,6 +209,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 			// silently started dropping. Off by default: the same behaviour
 			// absorbs a genuine rate peak, and a peak is legitimate.
 			"--require-pcr-position" => pcr_position_policy = PcrPositionPolicy::Fail,
+			"--track-clock" => track_clock = true,
 			// A permanent feed outlives any closing report, and the counters that
 			// matter over hours are the ones that are supposed to be *stationary*
 			// — buffer depth, recovered media rate, cushion. Emitting them on a
@@ -229,7 +233,8 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 	.with_pcr_mode(pcr)
 	.with_clocking(clocking)
 	.with_sequence_seed(sequence_seed)
-	.with_pcr_position_policy(pcr_position_policy);
+	.with_pcr_position_policy(pcr_position_policy)
+	.with_clock_tracking(track_clock);
 
 	// Order matters: the segment duration sets both depths, so an explicit
 	// latency or cap after it refines what it chose rather than being overwritten.

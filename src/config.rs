@@ -302,6 +302,13 @@ pub struct Config {
 	/// PCR values, under [`Clocking::Stream`]. See [`PcrPositionPolicy`].
 	pub pcr_position_policy: PcrPositionPolicy,
 
+	/// Under [`Clocking::Stream`], trim the release rate to the lead each PCR
+	/// arrives with, so a source delivering slower or faster than the host's
+	/// clock does not drain or fill the cushion. Off by default: experimental,
+	/// and it has trimmed by several ppm against a source whose PCRs kept the
+	/// host's rate.
+	pub track_clock: bool,
+
 	/// Under [`Clocking::Stream`], how long to watch the input before starting,
 	/// or `None` to start on the first content as before.
 	///
@@ -462,6 +469,7 @@ impl Config {
 			clocking: Clocking::default(),
 			sequence_seed: 0,
 			pcr_position_policy: PcrPositionPolicy::default(),
+			track_clock: false,
 			align: None,
 		}
 	}
@@ -583,6 +591,12 @@ impl Config {
 	/// values. See [`PcrPositionPolicy`].
 	pub fn with_pcr_position_policy(mut self, policy: PcrPositionPolicy) -> Self {
 		self.pcr_position_policy = policy;
+		self
+	}
+
+	/// Trim the release rate to the source's delivery. See [`Config::track_clock`].
+	pub fn with_clock_tracking(mut self, track: bool) -> Self {
+		self.track_clock = track;
 		self
 	}
 
