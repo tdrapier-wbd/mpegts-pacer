@@ -87,6 +87,14 @@ pub struct Stats {
 	/// behind by more than the cushion is dropped as late for good. A count that
 	/// keeps climbing is a source delivering slower than its own clock.
 	pub rejoins: u64,
+	/// Under [`Clocking::Stream`](crate::Clocking), how far the release rate is
+	/// trimmed from the mux rate on the host's clock to follow the source's own,
+	/// in parts per billion: negative for a source clock running slow.
+	///
+	/// A real source sits within a few tens of ppm and holds there. Without the
+	/// trim, a source this many ppb slow drains the cushion by as many
+	/// nanoseconds every second.
+	pub clock_trim_ppb: i64,
 	/// Stream in hand when the output clock started, in 188-byte packets at the
 	/// mux rate — the depth of the backlog a leg was handed as it joined.
 	///

@@ -93,6 +93,28 @@ const RECENT_SPANS: usize = 8;
 /// missed only if the continuity counters since the last PCR also break.
 const MISSED_PCR_FACTOR: u64 = 2;
 
+/// How long a stream-clocked leg watches its arrivals before judging how early
+/// they come. Longer than a segment's fetch interval, so the latest delivery in
+/// every window is one of a segmented source's deliveries, not a gap between two.
+const TRACK_WINDOW: Duration = Duration::from_secs(30);
+
+/// How hard [`ClockTrack`] closes on the source's clock: the trim it asks for is
+/// the margin's departure from where the leg started, as a rate over this many
+/// seconds. Long, so the trim is a property of the clock and not of one window's
+/// deliveries; at the 13.5 ppm a live source was measured at, it holds the
+/// margin about 25 ms short of where it started.
+const TRACK_TIME_CONSTANT: f64 = 1_800.0;
+
+/// The most [`ClockTrack`] trims the release rate. A conformant source's system
+/// clock is within 30 ppm of 27 MHz (ISO/IEC 13818-1 §2.4.2.1); the host's own
+/// error, and a margin, make up the rest.
+const TRACK_MAX_TRIM: f64 = 50e-6;
+
+/// The most the trim may move in one window: the standard's 0.075 Hz/s limit on
+/// how fast a system clock's frequency may change, so the output's PCR stays a
+/// clock a receiver can lock to.
+const TRACK_MAX_STEP: f64 = 0.075 * TRACK_WINDOW.as_secs_f64() / pcr::PCR_CLOCK_HZ as f64;
+
 /// Continuity state of a PID not yet seen, in [`StreamGrid::continuity`].
 const CC_UNSEEN: u8 = 0xff;
 /// Set beside the counter once a payload packet has repeated it: the standard
@@ -815,6 +837,87 @@ impl StreamGrid {
 	}
 }
 
+/// Holds a stream-clocked leg's release rate on its source's clock.
+///
+/// Stream clocking places content by PCR and releases slots at the mux rate on
+/// the host's clock. A source whose 27 MHz runs slow by a few parts per million
+/// then delivers every slot a little later, relative to its release, than the
+/// one before, and the cushion drains at that rate: at 13.5 ppm a one-second
+/// cushion is gone in about a day, and from then on each slot is released before
+/// its content arrives. Nothing upstream is at fault, and a restart cures it by
+/// starting a fresh margin, which is what makes it look like a fault upstream.
+///
+/// So the leg measures how far ahead of its due time each PCR arrives, keeps the
+/// least of these over a window — the latest delivery, which is the margin that
+/// matters — and trims the release rate in proportion to how far that has moved
+/// from the margin the leg started on. Anything that moves the grid or the clock
+/// (a re-base, a resync, a rejoin, a stall) starts the measurement again.
+#[derive(Debug, Clone)]
+struct ClockTrack {
+	window: Duration,
+	time_constant: f64,
+	max_trim: f64,
+	max_step: f64,
+	/// The fractional rate change in force: positive releases faster than the
+	/// mux rate on the host's clock, negative slower.
+	trim: f64,
+	/// The least lead, in seconds, of the first window measured since the leg
+	/// last started: the margin the trim holds.
+	reference: Option<f64>,
+	/// The window being measured: when it opened and the least lead in it.
+	open: Option<(Instant, f64)>,
+	/// Whether the next window is still the start's, whose backlog says nothing
+	/// about the clock.
+	settling: bool,
+	/// The re-base, resync, rejoin and stall count the measurement belongs to.
+	epoch: u64,
+}
+
+impl ClockTrack {
+	fn new() -> Self {
+		Self {
+			window: TRACK_WINDOW,
+			time_constant: TRACK_TIME_CONSTANT,
+			max_trim: TRACK_MAX_TRIM,
+			max_step: TRACK_MAX_STEP,
+			trim: 0.0,
+			reference: None,
+			open: None,
+			settling: true,
+			epoch: 0,
+		}
+	}
+
+	/// Fold in one PCR that arrived at `now`, `lead` seconds before its slot was
+	/// due (negative once after it), under `epoch`. Returns the trim to apply
+	/// when a window closes on a margin that asks for a different one.
+	fn observe(&mut self, now: Instant, lead: f64, epoch: u64) -> Option<f64> {
+		if epoch != self.epoch {
+			self.epoch = epoch;
+			self.reference = None;
+			self.open = None;
+			self.settling = true;
+		}
+		let (from, least) = self.open.get_or_insert((now, lead));
+		*least = least.min(lead);
+		if now.saturating_duration_since(*from) < self.window {
+			return None;
+		}
+		let least = *least;
+		self.open = None;
+		if std::mem::take(&mut self.settling) {
+			return None;
+		}
+		let Some(reference) = self.reference else {
+			self.reference = Some(least);
+			return None;
+		};
+		let wanted = ((least - reference) / self.time_constant).clamp(-self.max_trim, self.max_trim);
+		let trim = self.trim + (wanted - self.trim).clamp(-self.max_step, self.max_step);
+		(trim != self.trim).then_some(trim)
+	}
+}
+
 /// The CBR scheduler. See the module docs.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -851,6 +954,11 @@ pub struct Scheduler {
 	/// [`Clocking::Arrival`]; the first placed slot under [`Clocking::Stream`],
 	/// where the grid is absolute and a leg does not start at zero.
 	anchor_slot: u64,
+	/// Where the release clock runs from once [`ClockTrack`] has trimmed it:
+	/// the wall time a slot was due and the slot. `None` runs it from the anchor.
+	clock: Option<(Instant, u64)>,
+	/// Keeps a stream-clocked leg's release rate on its source's clock.
+	track: ClockTrack,
 	/// Position of the next output packet: a running count under
 	/// [`Clocking::Arrival`], an absolute grid index under [`Clocking::Stream`].
 	slot: u64,
@@ -893,8 +1001,14 @@ pub struct Scheduler {
 	/// count then: what [`SourceState::Behind`] is measured from.
 	sent_content_at: Option<Instant>,
 	late_drops_at_send: u64,
-	/// Whether the latest PCR to arrive was for a slot not yet released: a leg
-	/// whose input is on time is waiting on early content, not behind.
+	/// Whether the run the latest PCR closed started in a slot not yet released
+	/// (the new PCR's own slot, if that run was cut): a leg whose input is on time
+	/// is waiting on early content, not behind.
+	///
+	/// The run, not the PCR, because a run is placed only when the next PCR
+	/// arrives. Content about a cushion late can bring every PCR just before its
+	/// slot while each run is placed after its first slot was due, and the leg
+	/// then sends nothing at all while each PCR reads as on time.
 	arrived_on_time: bool,
 	scratch: Vec<u8>,
 	stats: Stats,
@@ -939,6 +1053,8 @@ impl Scheduler {
 			deferred: VecDeque::new(),
 			anchor: None,
 			anchor_slot: 0,
+			clock: None,
+			track: ClockTrack::new(),
 			slot: 0,
 			grid: (config.clocking == Clocking::Stream).then(|| StreamGrid::new(bitrate, capacity)),
 			phased: false,
@@ -996,9 +1112,12 @@ impl Scheduler {
 		});
 		if let Some(grid) = self.grid.as_mut() {
 			let has_pcr = packet.has_pcr();
+			let (closing, cut) = (grid.open_slot(), grid.cut);
 			let dropped = grid.push(packet, now, reach);
-			if has_pcr && reach.is_some() {
-				self.arrived_on_time = grid.open_slot().is_some_and(|slot| slot >= self.slot);
+			let pcr_slot = (has_pcr && reach.is_some()).then(|| grid.open_slot()).flatten();
+			if pcr_slot.is_some() {
+				let placed = closing.filter(|_| grid.cut == cut);
+				self.arrived_on_time = placed.or(pcr_slot).is_some_and(|slot| slot >= self.slot);
 			}
 			self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(dropped);
 			self.stats.pcr_position_overruns = grid.overruns();
@@ -1033,6 +1152,7 @@ impl Scheduler {
 						let start = edge.saturating_sub(self.latency_packets).max(first);
 						self.anchor = Some(self.anchor.unwrap_or(now + self.target));
 						self.anchor_slot = start - (start % per_datagram);
+						self.clock = None;
 						self.slot = self.anchor_slot;
 					}
 				}
@@ -1042,6 +1162,9 @@ impl Scheduler {
 			{
 				let gain = gain.as_micros().min(u128::from(u64::MAX)) as u64;
 				self.stats.align_gain_us = self.stats.align_gain_us.max(gain);
+			}
+			if let Some(slot) = pcr_slot {
+				self.track_clock(slot, now);
 			}
 			self.note_depth();
 			return;
@@ -1090,6 +1213,7 @@ impl Scheduler {
 		};
 		self.anchor = Some(anchor);
 		self.anchor_slot = start;
+		self.clock = None;
 		self.slot = start;
 	}
 
@@ -1344,8 +1468,52 @@ impl Scheduler {
 	/// Wall-clock instant the next output datagram is due, or `None` until the
 	/// first packet has armed the clock.
 	pub fn next_due(&self) -> Option<Instant> {
-		self.anchor
-			.map(|a| a + self.packets_to_duration(self.slot.saturating_sub(self.anchor_slot)))
+		self.due_of(self.slot)
+	}
+
+	/// Wall time output slot `slot` is due on the release clock, trimmed or not;
+	/// `None` before the clock is armed or for a slot due before the clock's epoch.
+	fn due_of(&self, slot: u64) -> Option<Instant> {
+		let (at, from) = self
+			.clock
+			.or_else(|| self.anchor.map(|anchor| (anchor, self.anchor_slot)))?;
+		let nominal = self.packets_to_duration(slot.abs_diff(from));
+		let span = if self.track.trim == 0.0 {
+			nominal
+		} else {
+			nominal.div_f64(1.0 + self.track.trim)
+		};
+		if slot >= from {
+			Some(at + span)
+		} else {
+			at.checked_sub(span)
+		}
+	}
+
+	/// Measure how early the PCR for `slot` arrived at `now` and, when
+	/// [`ClockTrack`] asks for a new trim, restart the release clock from the
+	/// current slot at the new rate, so no slot already due moves.
+	fn track_clock(&mut self, slot: u64, now: Instant) {
+		let Some(due) = self.due_of(slot) else {
+			return;
+		};
+		let lead = match due.checked_duration_since(now) {
+			Some(ahead) => ahead.as_secs_f64(),
+			None => -now.duration_since(due).as_secs_f64(),
+		};
+		let epoch = [
+			self.stats.resyncs,
+			self.stats.rejoins,
+			self.stats.pcr_rebases,
+			self.stats.stalls,
+		]
+		.iter()
+		.fold(0_u64, |sum, count| sum.saturating_add(*count));
+		if let Some(trim) = self.track.observe(now, lead, epoch) {
+			self.clock = self.due_of(self.slot).map(|at| (at, self.slot));
+			self.track.trim = trim;
+			self.stats.clock_trim_ppb = (trim * 1e9).round() as i64;
+		}
 	}
 
 	/// Where the next datagram sits in the stream, for a sink that numbers its
@@ -1550,8 +1718,8 @@ impl Scheduler {
 	}
 
 	/// Whether a stream-clocked leg has fallen behind its own slots: content is
-	/// arriving, the latest PCR was for a slot already released, packets are being
-	/// dropped late, and none has gone out for the stall timeout. See
+	/// arriving, the run the latest PCR closed started in a slot already released,
+	/// packets are being dropped late, and none has gone out for the stall timeout. See
 	/// [`SourceState::Behind`].
 	///
 	/// Arrival on time is what tells this from a leg holding early content, which
@@ -1643,6 +1811,7 @@ impl Scheduler {
 		}
 		self.anchor = Some(now);
 		self.anchor_slot = target;
+		self.clock = None;
 		self.slot = target;
 		// Content admitted for a slot the clock has just jumped over is backlog by
 		// the same definition as the placed packets `take` will now discard.
@@ -2616,7 +2785,13 @@ mod tests {
 	/// Feed `stream` to one stream-clocked leg on time and emit until it is all in;
 	/// return the counters and what was withheld after the first datagram went out.
 	fn drive_leg(cfg: &Config, stream: &[(Packet, Duration)]) -> (Stats, u64) {
+		drive_leg_tracking(cfg, stream, ClockTrack::new())
+	}
+
+	/// [`drive_leg`], with the leg's clock tracking set to `track`.
+	fn drive_leg_tracking(cfg: &Config, stream: &[(Packet, Duration)], track: ClockTrack) -> (Stats, u64) {
 		let mut sched = Scheduler::new(cfg);
+		sched.track = track;
 		let t0 = Instant::now();
 		let (mut next, mut withheld_at_start) = (0, None);
 		while next < stream.len() {
@@ -3163,6 +3338,110 @@ mod tests {
 		// at all once it streams again.
 		let (stats, _) = drive_leg(&cfg, &behind);
 		assert!((1..=6).contains(&stats.rejoins), "{} rejoins", stats.rejoins);
+	}
+
+	#[test]
+	fn a_leg_whose_runs_are_placed_late_is_behind_though_each_pcr_arrives_on_time() {
+		// Content that comes just under a cushion late: each PCR arrives a little
+		// before its slot, but its run is placed only when the next PCR arrives,
+		// by which time the run's first slot was due. The leg's margin is its
+		// cushion plus the PCR interval its first runs waited to close, so a delay
+		// between the cushion and that margin is the band. Inside it the leg sent
+		// nothing at all, for as long as it ran, reporting Live.
+		let cfg = stream_config().with_stall_timeout(Some(Duration::from_millis(200)));
+		let (from, runs) = (600, 2_000);
+		let interval = pcr::ticks_to_duration(RUN_SLOTS * TICKS_PER_PACKET);
+		let delay = Duration::from_millis(50) + interval / 2;
+		let late: Vec<_> = tagged(stream_packets(runs))
+			.into_iter()
+			.enumerate()
+			.map(|(i, (packet, at))| {
+				if i / RUN_LEN < from {
+					(packet, at)
+				} else {
+					(packet, at + delay)
+				}
+			})
+			.collect();
+		let leg = run_leg(&cfg, &late, Instant::now(), &PUNCTUAL, (runs as u64 + 200) * RUN_SLOTS);
+		let settled = from + 200;
+		let after = leg
+			.iter()
+			.flat_map(|(_, dg)| dg.chunks_exact(TS_PACKET_SIZE))
+			.filter(|p| pid_of(p) == 0x100 && tag_of(p) >= settled * RUN_LEN)
+			.count();
+		assert!(
+			after + 2 * RUN_LEN >= (runs - settled) * RUN_LEN,
+			"{after} of {} packets went out once the source was late",
+			(runs - settled) * RUN_LEN
+		);
+		let (stats, _) = drive_leg(&cfg, &late);
+		assert!((1..=2).contains(&stats.rejoins), "{} rejoins", stats.rejoins);
+	}
+
+	#[test]
+	fn a_source_clock_running_slow_is_followed_rather_than_drained() {
+		// A source whose clock runs slow delivers each slot later, relative to its
+		// release, than the one before. Released on the host's clock, the leg loses
+		// its cushion and falls behind; trimmed to the source's, it never does. The
+		// drift and the tracker's constants are scaled so this takes seconds: at
+		// the live source's 13.5 ppm and the defaults, a one-second cushion lasted
+		// about a day.
+		let cfg = stream_config().with_stall_timeout(Some(Duration::from_millis(200)));
+		let slow = 5e-3;
+		let stream: Vec<_> = stream_packets(6_000)
+			.into_iter()
+			.map(|(packet, at)| (packet, at.mul_f64(1.0 + slow)))
+			.collect();
+		let tracker = |max_trim| ClockTrack {
+			window: Duration::from_millis(200),
+			time_constant: 2.0,
+			max_trim,
+			max_step: 5e-4,
+			..ClockTrack::new()
+		};
+		let (untrimmed, _) = drive_leg_tracking(&cfg, &stream, tracker(0.0));
+		assert!(untrimmed.rejoins > 0, "the drift never drained the cushion");
+		let (trimmed, _) = drive_leg_tracking(&cfg, &stream, tracker(2e-2));
+		assert_eq!(trimmed.rejoins, 0, "the trimmed leg still fell behind");
+		assert!(trimmed.late_drops < 50, "{} packets late", trimmed.late_drops);
+		assert!(
+			(-5_500_000..=-4_500_000).contains(&trimmed.clock_trim_ppb),
+			"trimmed {} ppb for a source {} ppb slow",
+			trimmed.clock_trim_ppb,
+			(slow * 1e9) as i64
+		);
+	}
+
+	#[test]
+	fn the_default_trim_holds_the_margin_within_the_clock_tolerance() {
+		// The tracker against a modelled margin, one PCR a second for three days:
+		// the margin moves at the source's drift less the trim. Across the
+		// standard's whole clock tolerance it stays within a fifth of a second of
+		// where it started, and the trim never moves faster than a system clock is
+		// allowed to.
+		let t0 = Instant::now();
+		for drift in [-30e-6, -13.5e-6, 30e-6] {
+			let mut track = ClockTrack::new();
+			let (mut margin, mut worst) = (1.0_f64, 0.0_f64);
+			for second in 0..3 * 86_400_u64 {
+				margin += drift - track.trim;
+				worst = worst.max((margin - 1.0).abs());
+				if let Some(trim) = track.observe(t0 + Duration::from_secs(second), margin, 0) {
+					assert!(
+						(trim - track.trim).abs() <= TRACK_MAX_STEP * (1.0 + 1e-9),
+						"stepped {trim}"
+					);
+					track.trim = trim;
+				}
+			}
+			assert!(worst < 0.2, "the margin moved {worst:.3} s at {drift:e}");
+			assert!(
+				(track.trim - drift).abs() < 0.2e-6,
+				"trim {:e} for {drift:e}",
+				track.trim
+			);
+		}
 	}
 
 	#[test]

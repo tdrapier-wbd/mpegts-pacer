@@ -571,6 +571,11 @@ mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
 - `--stream-clock` -- place packets by stream position rather than by arrival, so
   two legs are a mergeable pair (see [Clocking](#clocking-whose-clock-decides-what-goes-in-each-slot)).
   Requires an explicit bitrate and an explicit `--latency-ms` or `--segment-ms`.
+  The release rate follows the source's clock rather than the host's: each 30 s
+  the leg compares how early its latest PCR arrived with how early it arrived at
+  the start, and trims the rate by up to 50 ppm, changing it no faster than the
+  0.075 Hz/s a system clock may move. Untrimmed, a source 13.5 ppm slow drained a
+  one-second cushion in about a day. `clock_trim_ppb` reports the trim.
 - `--sequence-seed N` -- RTP sequence offset (default 0), identical on both legs
   of a pair.
 - `--align-ms N` -- with `--stream-clock`, watch the input for N ms before

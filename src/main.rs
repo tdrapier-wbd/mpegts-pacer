@@ -431,7 +431,7 @@ fn sample(elapsed: Duration, health: &Health) {
 		 buffer={} buffer_high_water={} cushion_ms={} lead_ms={} media_rate_bps={} \
 		 content_gap_max_ms={} pcr_displacement={} rate_dpkts={:.1} rate_dsecs={:.6} \
 		 rate_intervals={} rate_pcrs={} pcr_rebases={} rate_max_pkts={} rate_subms={} clock_stalled={} rate_pending={} \
-		 withheld={} cut_runs={} align_gain_us={}",
+		 withheld={} cut_runs={} align_gain_us={} clock_trim_ppb={}",
 		elapsed.as_secs(),
 		health.source,
 		s.output_packets,
@@ -465,6 +465,7 @@ fn sample(elapsed: Duration, health: &Health) {
 		s.withheld_packets,
 		s.cut_runs_packets,
 		s.align_gain_us,
+		s.clock_trim_ppb,
 	);
 }
 
@@ -472,7 +473,7 @@ fn report(stats: &Stats) {
 	eprintln!(
 		"mpegts-pacer: done. output_packets={} content={} null={} ({:.1}% stuffing) \
 		 pcr_inserted={} stripped_nulls={} dropped={} late_drops={} resyncs={} rejoins={} start_backlog={} underruns={} \
-		 withheld={} cut_runs={} stalls={} muted={} max_content_gap={} ms align_gain_us={}",
+		 withheld={} cut_runs={} stalls={} muted={} max_content_gap={} ms align_gain_us={} clock_trim_ppb={}",
 		stats.output_packets,
 		stats.content_packets,
 		stats.null_packets,
@@ -491,6 +492,7 @@ fn report(stats: &Stats) {
 		stats.muted_packets,
 		stats.content_gap_max_ms,
 		stats.align_gain_us,
+		stats.clock_trim_ppb,
 	);
 	// The arrival shape the run actually saw, in the same terms an external
 	// cadence instrument reports it, so a groomed leg can be compared with the
