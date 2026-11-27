@@ -415,7 +415,7 @@ fn liveness(interval: Option<Duration>) -> CallbackObserver<impl FnMut(Health) +
 				health.stats.stalls, health.stats.content_gap_max_ms,
 			),
 			SourceState::Behind => eprintln!(
-				"mpegts-pacer: SOURCE BEHIND (content arriving, every packet late for its slot; rejoin #{})",
+				"mpegts-pacer: SOURCE BEHIND (content arriving late for its slots; rejoin #{})",
 				health.stats.rejoins + 1,
 			),
 			// The cushion it settled on is worth saying out loud the moment it

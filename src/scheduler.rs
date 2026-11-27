@@ -1001,6 +1001,12 @@ pub struct Scheduler {
 	/// count then: what [`SourceState::Behind`] is measured from.
 	sent_content_at: Option<Instant>,
 	late_drops_at_send: u64,
+	/// When late drops began coming no more than a stall timeout apart, when they
+	/// last came, and the count then: a leg sending part of its content while the
+	/// rest lands late is behind as surely as one sending none.
+	late_since: Option<Instant>,
+	late_at: Option<Instant>,
+	late_drops_seen: u64,
 	/// Whether the run the latest PCR closed started in a slot not yet released
 	/// (the new PCR's own slot, if that run was cut): a leg whose input is on time
 	/// is waiting on early content, not behind.
@@ -1069,6 +1075,9 @@ impl Scheduler {
 			stalled: false,
 			sent_content_at: None,
 			late_drops_at_send: 0,
+			late_since: None,
+			late_at: None,
+			late_drops_seen: 0,
 			arrived_on_time: false,
 			scratch: Vec::with_capacity(config.packets_per_datagram.max(1) * TS_PACKET_SIZE),
 			stats: Stats::default(),
@@ -1719,27 +1728,54 @@ impl Scheduler {
 			self.sent_content_at = Some(now);
 			self.late_drops_at_send = self.stats.late_drops;
 		}
+		if self.stats.late_drops > self.late_drops_seen {
+			self.late_drops_seen = self.stats.late_drops;
+			let unbroken = self
+				.late_at
+				.zip(self.stall_timeout())
+				.is_some_and(|(at, timeout)| now.saturating_duration_since(at) < timeout);
+			if !unbroken {
+				self.late_since = Some(now);
+			}
+			self.late_at = Some(now);
+		}
 		&self.scratch
 	}
 
 	/// Whether a stream-clocked leg has fallen behind its own slots: content is
 	/// arriving, the run the latest PCR closed started in a slot already released,
-	/// packets are being dropped late, and none has gone out for the stall timeout. See
-	/// [`SourceState::Behind`].
+	/// and either packets are being dropped late with none gone out for the stall
+	/// timeout, or late drops have kept coming, never a stall timeout apart, for a
+	/// stall timeout. See [`SourceState::Behind`].
 	///
 	/// Arrival on time is what tells this from a leg holding early content, which
 	/// also sends no content while its input is busy, and may still be dropping
-	/// the stale tail of a burst that came before it.
+	/// the stale tail of a burst that came before it. Late drops that began within
+	/// a stall timeout of the anchor are the backlog a start lets age out.
 	fn is_behind(&self, now: Instant) -> bool {
 		let (Some(timeout), Some(since)) = (self.stall_timeout(), self.sent_content_at.or(self.anchor)) else {
 			return false;
 		};
+		let unsent = self.stats.late_drops > self.late_drops_at_send && now.saturating_duration_since(since) >= timeout;
+		let running_short = self.late_since.zip(self.late_at).is_some_and(|(from, at)| {
+			now.saturating_duration_since(from) >= timeout
+				&& now.saturating_duration_since(at) < timeout
+				&& self
+					.anchor
+					.is_some_and(|anchor| from.saturating_duration_since(anchor) >= timeout)
+		});
 		self.grid.is_some()
 			&& !self.arrived_on_time
 			&& self.last_content_at.is_some()
 			&& self.silent_for(now) < timeout
-			&& self.stats.late_drops > self.late_drops_at_send
-			&& now.saturating_duration_since(since) >= timeout
+			&& (unsent || running_short)
+	}
+
+	/// Forget a stretch of late drops, counting those up to now as seen.
+	fn settle_late(&mut self) {
+		self.late_drops_seen = self.stats.late_drops;
+		self.late_since = None;
+		self.late_at = None;
 	}
 
 	/// Move a leg that fell behind to where live content belongs, as
@@ -1754,6 +1790,7 @@ impl Scheduler {
 		self.phased = false;
 		self.sent_content_at = Some(now);
 		self.late_drops_at_send = self.stats.late_drops;
+		self.settle_late();
 		self.arrived_on_time = false;
 		self.stats.rejoins = self.stats.rejoins.saturating_add(1);
 	}
@@ -1823,6 +1860,7 @@ impl Scheduler {
 		self.stats.late_drops = self.stats.late_drops.saturating_add(self.deferred.len() as u64);
 		self.deferred.clear();
 		self.phased = false;
+		self.settle_late();
 		self.stats.resyncs = self.stats.resyncs.saturating_add(1);
 	}
 
@@ -3345,6 +3383,42 @@ mod tests {
 		// at all once it streams again.
 		let (stats, _) = drive_leg(&cfg, &behind);
 		assert!((1..=6).contains(&stats.rejoins), "{} rejoins", stats.rejoins);
+	}
+
+	#[test]
+	fn a_leg_that_sends_only_part_of_its_content_rejoins_rather_than_running_short() {
+		// Content about a cushion late, a little either side of it in turn: half the
+		// runs land in time and half have their head in a slot already released.
+		// The leg keeps sending the runs in time, so it never goes a stall timeout
+		// without content, and it ran short of its stream, reporting Live, for as
+		// long as the source stayed that late: a source clock drifting the cushion
+		// away passes through this before the leg sends nothing at all.
+		let cfg = stream_config().with_stall_timeout(Some(Duration::from_millis(200)));
+		let (from, runs) = (600, 4_000);
+		let jitter = pcr::ticks_to_duration(RUN_SLOTS * TICKS_PER_PACKET) / 32;
+		let late: Vec<_> = tagged(stream_packets(runs))
+			.into_iter()
+			.enumerate()
+			.map(|(i, (packet, at))| match i / RUN_LEN {
+				run if run < from => (packet, at),
+				run if run % 2 == 0 => (packet, at + Duration::from_millis(50) + jitter),
+				_ => (packet, at + Duration::from_millis(50) - jitter),
+			})
+			.collect();
+		let leg = run_leg(&cfg, &late, Instant::now(), &PUNCTUAL, (runs as u64 + 200) * RUN_SLOTS);
+		let settled = from + 200;
+		let after = leg
+			.iter()
+			.flat_map(|(_, dg)| dg.chunks_exact(TS_PACKET_SIZE))
+			.filter(|p| pid_of(p) == 0x100 && tag_of(p) >= settled * RUN_LEN)
+			.count();
+		assert!(
+			after + 2 * RUN_LEN >= (runs - settled) * RUN_LEN,
+			"{after} of {} packets went out once the source was late",
+			(runs - settled) * RUN_LEN
+		);
+		let (stats, _) = drive_leg(&cfg, &late);
+		assert!((1..=2).contains(&stats.rejoins), "{} rejoins", stats.rejoins);
 	}
 
 	#[test]

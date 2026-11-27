@@ -79,8 +79,8 @@ pub struct Stats {
 	/// a buffer, i.e. the configured rate is below the content rate.
 	pub resyncs: u64,
 	/// Times a leg under [`Clocking::Stream`](crate::Clocking) whose content kept
-	/// arriving but had sent none of it for the stall timeout, every packet late
-	/// for its slot, moved its grid to where live content belongs. See
+	/// arriving too late for its slots, for the stall timeout, moved its grid to
+	/// where live content belongs. See
 	/// [`SourceState::Behind`](crate::SourceState::Behind).
 	///
 	/// The output clock cannot run backwards, so without this a source that falls

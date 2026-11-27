@@ -567,8 +567,8 @@ mpegts-pacer <-|stdout|dest_ip:port> <bitrate_bps|auto> [--rtp] [--preserve]
 - `--stall-grace-ms N` -- change that one second.
 - `--on-stall mute|continue|fail` -- what to do then (default `mute`). Transitions
   are logged to stderr either way. With `--stream-clock`, a source whose content
-  keeps arriving but late for every slot, so that none has gone out for the same
-  timeout, is behind rather than stalled: `fail` exits, and the other two rejoin
+  keeps arriving but late for its slots (none gone out for the same timeout, or
+  late drops for that long while the rest goes out) is behind rather than stalled: `fail` exits, and the other two rejoin
   the stream where live content belongs, counted in `rejoins`.
 - `--start-grace-ms N` -- how long after the start `fail` mutes instead of
   exiting (default 10000). A source just started pauses as it connects and

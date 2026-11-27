@@ -41,9 +41,10 @@ pub enum SourceState {
 	Stalled,
 
 	/// Under [`Clocking::Stream`](crate::Clocking): content is still arriving, but
-	/// every packet lands in a slot the output has already passed, and none has
-	/// been sent for longer than the stall timeout. The source fell further behind
-	/// its own clock than the cushion holds.
+	/// it lands in slots the output has already passed, so that either none has
+	/// been sent for longer than the stall timeout, or late drops have kept coming
+	/// for that long while the rest goes out. The source fell further behind its
+	/// own clock than the cushion holds.
 	///
 	/// No arrival-based reading sees this — the input is busy — so a leg left to
 	/// it would carry silence for good while reporting itself live. The leg

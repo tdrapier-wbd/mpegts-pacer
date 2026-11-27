@@ -37,12 +37,11 @@ pub enum Error {
 		silent_for: Duration,
 	},
 
-	/// A stream-clocked leg's content kept arriving, every packet of it too late
-	/// for its slot, and none was sent for longer than
-	/// [`Config::stall`](crate::Config::stall), under
+	/// A stream-clocked leg's content kept arriving too late for its slots, for
+	/// longer than [`Config::stall`](crate::Config::stall), under
 	/// [`StallPolicy::Fail`](crate::StallPolicy::Fail). See
 	/// [`SourceState::Behind`](crate::SourceState::Behind).
-	#[error("source behind: content arriving but none sent for {unsent_for:?}, every packet late")]
+	#[error("source behind: content arriving late for its slots, {unsent_for:?} since any was sent")]
 	SourceBehind {
 		/// How long the leg had sent no content when the pacer gave up.
 		unsent_for: Duration,
